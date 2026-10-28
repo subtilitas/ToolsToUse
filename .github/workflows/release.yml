@@ -6,6 +6,7 @@ on:
       - '*-v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -13,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -24,6 +27,14 @@ jobs:
           name="${tag%-v*}"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=${tag##*-v}" >> "$GITHUB_OUTPUT"
+      - name: Check that the tagged commit is on main and passed CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+          ok=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
+          [ "$ok" -gt 0 ] || { echo "::error::no successful CI run for $GITHUB_SHA"; exit 1; }
       - run: sudo apt-get update -q && sudo apt-get install -y -q pandoc doxygen
       - name: Run the tests
         working-directory: tools/${{ steps.tag.outputs.name }}

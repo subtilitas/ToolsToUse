@@ -19,8 +19,8 @@ python scripts/coverage_readme.py pdf2md     # measure one tool, keep the other 
 
 @par Exit codes
 - 0: README.md is current (--check) or was written.
-- 1: README.md differs from the measurement (--check), a marker is missing, or
-  a test run failed.
+- 1: README.md differs from the measurement (--check), a marker is missing, a
+  named tool does not exist, or a test run failed.
 """
 
 import argparse

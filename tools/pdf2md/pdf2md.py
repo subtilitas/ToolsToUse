@@ -5758,7 +5758,6 @@ def main(argv=None):
     ap.add_argument(
         '--toc-depth',
         type=int,
-        default=3,
         metavar='N',
         help='with --split-pages: outline levels that become folders (default 3, 0 = no folders)',
     )
@@ -5773,7 +5772,7 @@ def main(argv=None):
     ap.add_argument('-q', '--quiet', action='store_true', help='no progress output on stderr')
     args = ap.parse_args(argv)
 
-    if not args.split_pages and (args.flat or args.toc_depth != 3):
+    if not args.split_pages and (args.flat or args.toc_depth is not None):
         print('pdf2md: --flat and --toc-depth need --split-pages', file=sys.stderr)
         return 1
     if args.split_pages and args.page_markers:
@@ -5785,6 +5784,8 @@ def main(argv=None):
     else:
         out = args.output or os.path.splitext(args.pdf)[0] + '.md'
         assets = args.assets or os.path.splitext(out)[0] + '_assets'
+    if args.toc_depth is None:
+        args.toc_depth = 3
     if args.toc_depth < 0:
         print('pdf2md: --toc-depth must be 0 or more', file=sys.stderr)
         return 1

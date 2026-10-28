@@ -9,5 +9,5 @@ A release is tagged `pdf2md-v<version>`.
 ### Added
 
 - `pdf2md.py`: PDF to Markdown converter, single file, Python standard library only.
-- `test_pdf2md.py`: 42 regression tests.
+- `test_pdf2md.py`: 43 regression tests.
 - `Doxyfile`: Doxygen configuration for the API documentation.

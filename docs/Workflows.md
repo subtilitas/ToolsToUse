@@ -17,17 +17,19 @@ Runs on every push and pull request.
 
 The coverage job fails when the table in `README.md` differs from the measurement.
 The fix is to run `python scripts/coverage_readme.py` and commit `README.md`.
-Results can differ by 1 % between Python versions and platforms.
 The CI measurement on Python 3.13 with pandoc is the reference.
+On Python 3.13 on Linux the value is the same with and without pandoc.
+Other Python versions and platforms can give a different value; the size of the difference is not measured.
 
 ## Docs (`docs.yml`)
 
-Runs on pushes to `main` and pull requests that touch `README.md`, `docs/`, `tools/` or the workflow, and on manual dispatch.
+Runs on pushes to `main` and pull requests that touch `README.md`, `docs/`, `tools/`, `scripts/build_wiki.py` or the workflow, and on manual dispatch.
 
 1. Builds the Doxygen HTML of every tool. Fails on a missing `Doxyfile` or a non-empty `doxygen_warnings.txt`.
    The HTML is uploaded as the artifact `doxygen-html`.
 2. Builds the wiki pages with `scripts/build_wiki.py`.
 3. On `main` only: pushes the pages to the repository wiki with the workflow token.
+   Wiki pushes run one at a time (concurrency group `wiki`); a newer pending run replaces an older pending one.
 
 Wiki pages:
 
@@ -39,6 +41,8 @@ Wiki pages:
 | `tools/<name>/CHANGELOG.md` | `<name>-Changelog` |
 
 The wiki is generated. Edits made in the wiki are overwritten by the next run.
+Relative image links point to the raw file in the repository.
+Links inside code blocks and inline code are left unchanged.
 
 Current limitation: GitHub creates the wiki repository only after the first page is saved in the web interface.
 Until then the push step fails with "Repository not found".
@@ -50,9 +54,11 @@ Runs on tags of the form `<name>-v<major>.<minor>.<patch>`, for example `pdf2md-
 
 1. `scripts/release_notes.py` checks the tag and reads the section `## [<version>]` from `tools/<name>/CHANGELOG.md`.
    A tag without that section fails.
-2. Runs the tests of the tool.
-3. Builds the Doxygen HTML. Fails on warnings.
-4. Publishes a GitHub release with these files:
+2. Checks that the tagged commit is on `main` and that a CI run of that commit concluded with success.
+   A tag on another branch, or on a commit whose CI is still running or failed, fails.
+3. Runs the tests of the tool.
+4. Builds the Doxygen HTML. Fails on warnings.
+5. Publishes a GitHub release with these files:
 
 | File | Content |
 | --- | --- |
@@ -64,7 +70,7 @@ To release:
 
 ```sh
 # in tools/<name>/CHANGELOG.md: rename "## [Unreleased]" to "## [1.0.0] - YYYY-MM-DD",
-# add a new empty "## [Unreleased]" above it, commit
+# add a new empty "## [Unreleased]" above it, commit, merge to main, wait for CI
 git tag pdf2md-v1.0.0
 git push origin pdf2md-v1.0.0
 ```

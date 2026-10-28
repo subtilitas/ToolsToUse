@@ -51,6 +51,9 @@ jobs:
   wiki:
     needs: doxygen
     runs-on: ubuntu-latest
+    concurrency:
+      group: wiki
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
