@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*-v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Check the tag and extract the release notes
+        id: tag
+        run: |
+          tag="$GITHUB_REF_NAME"
+          python scripts/release_notes.py "$tag" > build-notes.md
+          name="${tag%-v*}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=${tag##*-v}" >> "$GITHUB_OUTPUT"
+      - run: sudo apt-get update -q && sudo apt-get install -y -q pandoc doxygen
+      - name: Run the tests
+        working-directory: tools/${{ steps.tag.outputs.name }}
+        run: python -m unittest -v "test_${{ steps.tag.outputs.name }}"
+      - name: Build the release files
+        env:
+          NAME: ${{ steps.tag.outputs.name }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          mkdir -p build/release
+          (cd "tools/$NAME" && doxygen Doxyfile)
+          [ ! -s "tools/$NAME/doxygen_warnings.txt" ] || { cat "tools/$NAME/doxygen_warnings.txt"; exit 1; }
+          (cd "tools/$NAME/doxygen" && zip -q -r "$GITHUB_WORKSPACE/build/release/$NAME-$VERSION-docs.zip" html)
+          stage="build/stage/$NAME-$VERSION"
+          mkdir -p "$stage"
+          cp "tools/$NAME/$NAME.py" "tools/$NAME/README.md" "tools/$NAME/CHANGELOG.md" LICENSE "$stage/"
+          (cd build/stage && zip -q -r "$GITHUB_WORKSPACE/build/release/$NAME-$VERSION.zip" "$NAME-$VERSION")
+          cp "tools/$NAME/$NAME.py" build/release/
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" build/release/* --title "$GITHUB_REF_NAME" --notes-file build-notes.md --verify-tag

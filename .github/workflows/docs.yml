@@ -1,0 +1,79 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'docs/**'
+      - 'tools/**'
+      - 'scripts/build_wiki.py'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'docs/**'
+      - 'tools/**'
+      - 'scripts/build_wiki.py'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  doxygen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update -q && sudo apt-get install -y -q doxygen
+      - name: Build the API documentation of every tool, fail on warnings
+        run: |
+          status=0
+          mkdir -p build/doxygen
+          for dir in tools/*/; do
+            name=$(basename "$dir")
+            [ -f "$dir/Doxyfile" ] || { echo "::error::$dir has no Doxyfile"; status=1; continue; }
+            (cd "$dir" && doxygen Doxyfile) || { status=1; continue; }
+            if [ -s "$dir/doxygen_warnings.txt" ]; then
+              echo "::error::Doxygen warnings in $name"
+              cat "$dir/doxygen_warnings.txt"
+              status=1
+            fi
+            cp -r "$dir/doxygen/html" "build/doxygen/$name"
+          done
+          exit $status
+      - uses: actions/upload-artifact@v7
+        with:
+          name: doxygen-html
+          path: build/doxygen
+
+  wiki:
+    needs: doxygen
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Build the wiki pages
+        run: python scripts/build_wiki.py build/wiki --blob-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/main"
+      - name: Push the wiki pages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git clone "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.wiki.git" build/wiki-repo
+          python scripts/build_wiki.py build/wiki-repo --blob-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/main"
+          cd build/wiki-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki is current"
+          else
+            git commit -q -m "Update wiki from ${GITHUB_SHA::7}"
+            git push -q
+          fi
