@@ -1,0 +1,11 @@
+# Tool configuration only. The repository is not an installable package.
+
+[tool.black]
+line-length = 100
+skip-string-normalization = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["F", "E9"]

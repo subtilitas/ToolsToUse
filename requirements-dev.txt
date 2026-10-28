@@ -1,0 +1,4 @@
+# Development and CI tools. The tools in tools/ need none of these.
+black==26.5.1
+ruff==0.16.9
+coverage==7.17.0
