@@ -33,7 +33,7 @@ python pdf2md.py input.pdf --split-pages --flat   # page files without folders
 | `--no-figures` | Skip table, diagram and image export. |
 | `-q`, `--quiet` | No progress output on stderr. |
 
-`--flat` and `--toc-depth` need `--split-pages`.
+`--flat` and `--toc-depth` with any value need `--split-pages`; without it they exit with code 1.
 An output path equal to the input file is rejected.
 
 ## Exit codes
@@ -129,7 +129,7 @@ Output of a file that hits one is incomplete.
 
 ## Tests
 
-`test_pdf2md.py` holds 42 regression tests.
+`test_pdf2md.py` holds 43 regression tests.
 Each test builds the PDF it needs in a temporary directory.
 They need no network access.
 Tests that render Markdown with pandoc are skipped when pandoc is not installed.

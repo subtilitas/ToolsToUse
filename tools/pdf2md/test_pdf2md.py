@@ -616,6 +616,17 @@ class CommandLine(Base):
         rc, _, _ = self.cli('--toc-depth', 'x', 'a.pdf')
         self.assertEqual(rc, 1)
 
+    def test_split_options_need_split_pages(self):
+        """!
+        @brief Test: --toc-depth and --flat without --split-pages exit 1, also at the default depth.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        for opts in (['--toc-depth', '3'], ['--toc-depth', '0'], ['--flat']):
+            rc, _, err = self.cli('-q', f, '-o', self.path('o.md'), *opts)
+            self.assertEqual(rc, 1, opts)
+            self.assertIn('need --split-pages', err)
+
     def test_output_equal_to_input(self):
         """!
         @brief Test: output equal to input.

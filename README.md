@@ -12,7 +12,9 @@ Each tool lives in its own folder under `tools/` with its tests, documentation a
 
 ## Test coverage
 
-Combined line and branch coverage of each tool script, measured by CI on Python 3.13 with pandoc installed.
+Combined line and branch coverage of each tool script.
+`scripts/coverage_readme.py` writes the table.
+The CI coverage job (Python 3.13, pandoc installed) fails when the table differs from its measurement.
 Child processes started by the tests are included.
 
 <!-- coverage:start -->

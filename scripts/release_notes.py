@@ -7,6 +7,9 @@ A release tag has the form <name>-v<major>.<minor>.<patch>, for example
 pdf2md-v1.0.0. The tool folder tools/<name>/ must exist, and
 tools/<name>/CHANGELOG.md must have a section that starts with
 "## [<major>.<minor>.<patch>]". The body of that section is printed to stdout.
+The body ends at the next "## " heading or at the first link reference
+definition ("[1.0.0]: https://..."), whichever comes first. Lines inside fenced
+code blocks never end it.
 
 @code{.sh}
 python scripts/release_notes.py pdf2md-v1.0.0
@@ -23,6 +26,10 @@ import sys
 
 ## repository root
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+## pattern of a link reference definition, which ends a section body
+_LINKREF_RE = re.compile(r'^ {0,3}\[[^\]]+\]:\s')
+## pattern of a fence line that opens or closes a code block
+_FENCE_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
 ## pattern of a release tag
 TAG_RE = re.compile(r'^(?P<name>[a-z0-9][a-z0-9_]*)-v(?P<version>\d+\.\d+\.\d+)$')
 
@@ -47,8 +54,15 @@ def notes(tag):
     for i, ln in enumerate(lines):
         if ln.startswith(head):
             body = []
+            fence = None
             for nxt in lines[i + 1 :]:
-                if nxt.startswith('## '):
+                f = _FENCE_RE.match(nxt)
+                if fence:
+                    if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence):
+                        fence = None
+                elif f:
+                    fence = f.group(1)
+                elif nxt.startswith('## ') or _LINKREF_RE.match(nxt):
                     break
                 body.append(nxt)
             return name, '\n'.join(body).strip() + '\n'
