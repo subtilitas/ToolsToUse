@@ -13,7 +13,10 @@ PDF2MD=/path/to/pdf2md.py python test_pdf2md.py
 @endcode
 """
 
+import contextlib
+import errno
 import importlib.util
+import io
 import os
 import shutil
 import subprocess
@@ -21,6 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock as mock
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -887,6 +891,261 @@ class Contents(Base):
             [(b'Menu', b'x')] * 2,
         )
         self.assertEqual(self.folders(f), ['page_0001.md', 'page_0002.md', 'page_0003.md'])
+
+
+class OutputSafety(Base):
+    """!
+    @brief Output files never overwrite the input; writes are atomic; problems give exit 3.
+    """
+
+    def link(self, kind, src, dst):
+        """!
+        @brief Create a symbolic or hard link, or skip the test where that is not possible.
+        @param kind 'sym' or 'hard'
+        @param src existing file
+        @param dst link path
+        """
+        try:
+            if kind == 'sym':
+                os.symlink(src, dst)
+            else:
+                os.link(src, dst)
+        except (OSError, NotImplementedError, AttributeError) as exc:
+            self.skipTest('cannot create a %s link: %s' % (kind, exc))
+
+    def image_pdf(self):
+        """!
+        @brief Write a one-page PDF with text and a 2x2 gray image.
+        @return path of the PDF
+        """
+        f = self.path('a.pdf')
+        make_pdf(
+            f,
+            HELLO + b'q 200 0 0 200 100 100 cm /Im1 Do Q\n',
+            [
+                stream(
+                    b'\x00\xff\xff\x00',
+                    b'/Type /XObject /Subtype /Image /Width 2 /Height 2 '
+                    b'/ColorSpace /DeviceGray /BitsPerComponent 8',
+                )
+            ],
+            resources=b'/XObject << /Im1 6 0 R >>',
+        )
+        return f
+
+    def run_main(self, *args):
+        """!
+        @brief Run P.main in this process.
+        @param args command-line arguments
+        @return (exit code, stderr text)
+        """
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = P.main(list(args))
+        return rc, err.getvalue()
+
+    def test_symlink_output_to_input_is_refused(self):
+        """!
+        @brief Test: an output file that is a symbolic link to the input is refused.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        before = _readb(f)
+        out = self.path('out.md')
+        self.link('sym', f, out)
+        rc, _, err = self.cli('-q', f, '-o', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertEqual(_readb(f), before)
+
+    def test_hard_link_output_to_input_is_refused(self):
+        """!
+        @brief Test: an output file that is a hard link to the input is refused.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        before = _readb(f)
+        out = self.path('out.md')
+        self.link('hard', f, out)
+        rc, _, err = self.cli('-q', f, '-o', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertEqual(_readb(f), before)
+
+    def test_convert_refuses_alias_of_input(self):
+        """!
+        @brief Test: convert() called directly with an alias of the input raises UsageError.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        before = _readb(f)
+        out = self.path('out.md')
+        self.link('hard', f, out)
+        with self.assertRaises(P.UsageError):
+            P.convert(f, out, self.path('assets'))
+        with self.assertRaises(P.UsageError):
+            P.convert(f, os.path.join(self.path('x'), '..', 'a.pdf'), self.path('assets'))
+        self.assertEqual(_readb(f), before)
+
+    def test_split_page_and_asset_aliases_keep_input(self):
+        """!
+        @brief Test: with --split-pages, page and figure files that link to the input do
+        not change it.
+        """
+        f = self.image_pdf()
+        before = _readb(f)
+        o = self.path('o')
+        rc, _, _ = self.cli('-q', '--split-pages', f, '-o', o)
+        self.assertEqual(rc, 0)
+        assets = os.listdir(os.path.join(o, '_assets'))
+        self.assertEqual(len(assets), 1)
+        # a page file that links to the input: refused before anything is written
+        shutil.rmtree(o)
+        os.makedirs(o)
+        self.link('sym', f, os.path.join(o, 'page_0001.md'))
+        rc, _, err = self.cli('-q', '--split-pages', f, '-o', o)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertFalse(os.path.exists(os.path.join(o, 'index.md')))
+        self.assertEqual(_readb(f), before)
+        # a figure file that links to the input
+        shutil.rmtree(o)
+        os.makedirs(os.path.join(o, '_assets'))
+        self.link('sym', f, os.path.join(o, '_assets', assets[0]))
+        rc, _, err = self.cli('-q', '--split-pages', f, '-o', o)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertEqual(_readb(f), before)
+        # index.md as a hard link to the input
+        shutil.rmtree(o)
+        os.makedirs(o)
+        self.link('hard', f, os.path.join(o, 'index.md'))
+        with self.assertRaises(P.UsageError):
+            P.convert_split(f, o)
+        self.assertEqual(_readb(f), before)
+
+    def test_failed_write_keeps_old_file(self):
+        """!
+        @brief Test: a write that fails half-way keeps the old output and leaves no
+        temporary file.
+        """
+        f = self.image_pdf()
+        out = self.path('out.md')
+        _write(out, b'old content\n')
+        real = os.fdopen
+
+        class Full:
+            """!
+            @brief File wrapper that writes half the data, then fails like a full disk.
+            """
+
+            def __init__(self, fh):
+                """!
+                @brief Wrap an open file.
+                @param fh file object
+                """
+                ## the wrapped file
+                self.fh = fh
+
+            def __enter__(self):
+                """!
+                @brief Enter the context.
+                @return self
+                """
+                return self
+
+            def __exit__(self, *exc):
+                """!
+                @brief Close the wrapped file.
+                @param exc exception information
+                """
+                self.fh.close()
+
+            def write(self, data):
+                """!
+                @brief Write half the data, then raise ENOSPC.
+                @param data bytes to write
+                """
+                self.fh.write(data[: len(data) // 2])
+                raise OSError(errno.ENOSPC, 'No space left on device')
+
+        with mock.patch.object(P.os, 'fdopen', lambda *a, **k: Full(real(*a, **k))):
+            rc, err = self.run_main('-q', f, '-o', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('No space left', err)
+        self.assertEqual(_readb(out), b'old content\n')
+        left = [n for _, _, fs in os.walk(self.path('')) for n in fs if n.endswith('.tmp')]
+        self.assertEqual(left, [])
+        # a normal run replaces the file
+        rc, err = self.run_main('-q', f, '-o', out)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('Hello world', _read(out))
+
+    def test_page_error_exits_3_with_output(self):
+        """!
+        @brief Test: a page that fails in layout gives exit 3, the Markdown file, and the
+        problem on stderr, also with -q and with --split-pages.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        out = self.path('out.md')
+
+        def boom(*a, **k):
+            """!
+            @brief Fail like a layout bug.
+            @param a ignored
+            @param k ignored
+            """
+            raise ValueError('broken layout')
+
+        with mock.patch.object(P, 'layout_page', boom):
+            rc, err = self.run_main('-q', f, '-o', out)
+            self.assertEqual(rc, 3)
+            self.assertTrue(os.path.exists(out))
+            self.assertIn('page 1:', err)
+            self.assertIn('broken layout', err)
+            rc, err = self.run_main('-q', '--split-pages', f, '-o', self.path('o'))
+            self.assertEqual(rc, 3)
+            self.assertTrue(os.path.exists(self.path('o/index.md')))
+            self.assertIn('page 1:', err)
+        # the next run starts with no problems
+        rc, err = self.run_main('-q', f, '-o', out)
+        self.assertEqual((rc, err), (0, ''))
+
+    def test_failure_after_partial_output_exits_2(self):
+        """!
+        @brief Test: an exception after some files were written exits with code 2.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        real = P._write_atomic
+
+        def fail_index(path, data):
+            """!
+            @brief Write page files, fail on index.md.
+            @param path target path
+            @param data file contents
+            """
+            if path.endswith('index.md'):
+                raise RuntimeError('index failed')
+            real(path, data)
+
+        with mock.patch.object(P, '_write_atomic', fail_index):
+            rc, err = self.run_main('-q', '--split-pages', f, '-o', self.path('o'))
+        self.assertEqual(rc, 2)
+        self.assertIn('index failed', err)
+        self.assertTrue(os.path.exists(self.path('o/page_0001.md')))
+
+    def test_clean_file_exits_0_silently(self):
+        """!
+        @brief Test: a clean file exits 0 with empty stderr under -q.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        rc, _, err = self.cli('-q', f, '-o', self.path('out.md'))
+        self.assertEqual((rc, err), (0, ''))
+        rc, _, err = self.cli('-q', '--split-pages', f, '-o', self.path('o'))
+        self.assertEqual((rc, err), (0, ''))
 
 
 if __name__ == '__main__':

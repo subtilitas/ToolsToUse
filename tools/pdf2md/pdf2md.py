@@ -4534,18 +4534,27 @@ class Exporter:
                 self.cache[key] = None
         return self.cache[key]
 
+    ## @brief Path of the input PDF file; _write refuses a target that refers to it.
+    ## None skips the check. convert() and convert_split() set it.
+    source = None
+
     def _write(self, name, data):
         """!
         @brief Write a file into the assets directory, creating the directory if needed.
 
+        The file is written through a temporary file and os.replace (see _write_atomic),
+        so an existing file stays intact when the write fails.
+
         @param name File name.
         @param data File contents as bytes.
         @return Path of the written file.
+        @exception UsageError when the target refers to the input file (see _check_output).
         """
         os.makedirs(self.assets_dir, exist_ok=True)
         path = os.path.join(self.assets_dir, name)
-        with open(path, 'wb') as fh:
-            fh.write(data)
+        if self.source is not None:
+            _check_output(path, self.source)
+        _write_atomic(path, data)
         return path
 
     def _rel(self, path):
@@ -5282,9 +5291,95 @@ def _page_markdown(writer, exporter, lay, marker=None):
             writer.add_line(obj)
 
 
+def _same_file(path, source):
+    """!
+    @brief Tell whether a path refers to the same file as the source path.
+
+    True when both resolve to the same path after following symbolic links
+    (os.path.realpath), or when both exist and os.stat (which follows links) gives the
+    same device and a non-zero inode number, which also matches hard links.
+
+    @param path Output path; it need not exist.
+    @param source Path of the input file.
+    @return True when writing to path through open() would change source.
+    """
+    try:
+        if os.path.normcase(os.path.realpath(path)) == os.path.normcase(os.path.realpath(source)):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        a, b = os.stat(path), os.stat(source)
+    except (OSError, ValueError):
+        return False
+    return a.st_ino != 0 and os.path.samestat(a, b)
+
+
+def _check_output(path, source):
+    """!
+    @brief Refuse an output path that refers to the input file.
+
+    @param path Output path.
+    @param source Path of the input file.
+    @exception UsageError when path refers to source (see _same_file).
+    """
+    if _same_file(path, source):
+        raise UsageError(
+            'the output path %s refers to the input file %s; choose another one with -o'
+            % (path, source)
+        )
+
+
+def _write_atomic(path, data):
+    """!
+    @brief Write a file through a temporary file in the same directory and os.replace.
+
+    The temporary file name is a dot, the target name cut to 32 characters, a dot, 12
+    random hex digits and .tmp. It is created exclusively with mode 0666 minus the
+    umask; it takes the mode of an existing regular file at path. os.replace then swaps it in; a symbolic link at path is
+    replaced by the file, its target is not written. When anything fails, the temporary
+    file is removed and an existing file at path keeps its content.
+
+    @param path Target path; its directory must exist.
+    @param data File contents as bytes.
+    @exception OSError when the file cannot be written or replaced.
+    """
+    folder, name = os.path.split(os.path.abspath(path))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+    for _ in range(100):
+        tmp = os.path.join(folder, '.%s.%s.tmp' % (name[:32], os.urandom(6).hex()))
+        try:
+            fd = os.open(tmp, flags, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError('cannot create a temporary file in %s' % folder)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            st = None
+        if st is not None and (st.st_mode & 0o170000) == 0o100000:  # regular file
+            os.chmod(tmp, st.st_mode & 0o7777)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def convert(pdf_path, md_path, assets_dir, pages=None, page_markers=False, figures=True, log=None):
     """!
     @brief Write one Markdown file for the whole document.
+
+    An output path that refers to the input file (same path, symbolic link or hard link)
+    is refused before the input is read. Every file is written through a temporary file
+    (see _write_atomic).
 
     @param pdf_path Path of the PDF file.
     @param md_path Path of the Markdown file to write (UTF-8, LF line endings).
@@ -5294,18 +5389,25 @@ def convert(pdf_path, md_path, assets_dir, pages=None, page_markers=False, figur
     @param figures False to skip figure export.
     @param log Function that receives progress messages, or None.
     @return Counter of exported figures per label.
+    @exception UsageError when md_path or a figure file refers to the input file.
     """
+    _check_output(md_path, pdf_path)
     doc, _, layouts = analyze(pdf_path, pages, figures, log)
     md_dir = os.path.dirname(os.path.abspath(md_path))
     os.makedirs(md_dir, exist_ok=True)
     exporter = Exporter(doc, assets_dir, md_dir)
+    exporter.source = pdf_path
     writer = MarkdownWriter(_heading_levels(layouts))
-    for lay in layouts:
-        _page_markdown(
-            writer, exporter, lay, '<!-- page %d -->' % lay.number if page_markers else None
-        )
-    with open(md_path, 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write(writer.text())
+    try:
+        for lay in layouts:
+            _CURRENT_PAGE[0] = lay.number
+            _page_markdown(
+                writer, exporter, lay, '<!-- page %d -->' % lay.number if page_markers else None
+            )
+    finally:
+        _CURRENT_PAGE[0] = None
+    _check_output(md_path, pdf_path)
+    _write_atomic(md_path, writer.text().encode('utf-8'))
     return exporter.counts
 
 
@@ -5657,6 +5759,11 @@ def convert_split(
     are named page_NNNN.md, zero-padded to at least 4 digits. index.md lists the outline
     entries with links to their start pages, or all page files when there is no outline.
 
+    An outline or page label tree that cannot be read is recorded with problem(). An
+    output path (a page file, index.md or a figure file) that refers to the input file
+    is refused; page files and index.md are checked before anything is written. Every
+    file is written through a temporary file (see _write_atomic).
+
     @param pdf_path Path of the PDF file.
     @param out_dir Output directory.
     @param assets_dir Directory for figure files; None uses out_dir/_assets.
@@ -5665,7 +5772,10 @@ def convert_split(
     @param toc_depth Outline levels that become folders; 0 for no folders and no outline.
     @param log Function that receives progress messages, or None.
     @return Tuple (figure counts, number of page files, number of outline entries).
+    @exception UsageError when an output file refers to the input file.
     """
+    index_path = os.path.join(os.path.abspath(out_dir), 'index.md')
+    _check_output(index_path, pdf_path)
     doc, page_list, layouts = analyze(pdf_path, pages, figures, log)
     numbers = {id(p): n for n, (p, _) in enumerate(page_list, 1)}
     source = None
@@ -5675,15 +5785,17 @@ def convert_split(
             outline = doc.outline(numbers)
         except Exception as exc:  # malformed outline: continue without it
             outline = []
-            if log:
-                log('outline not readable: %s' % exc)
+            problem('malformed', 'outline not readable (%s: %s)' % (type(exc).__name__, exc))
         if outline:
             source = 'PDF outline (bookmarks)'
         else:
             try:
                 labels = doc.page_labels(len(page_list))
-            except Exception:
+            except Exception as exc:
                 labels = None
+                problem(
+                    'malformed', 'page labels not readable (%s: %s)' % (type(exc).__name__, exc)
+                )
             outline, toc_pages = printed_toc(layouts, labels, log, len(page_list))
             if outline:
                 source = 'printed table of contents on page %s' % _page_span(toc_pages)
@@ -5696,9 +5808,11 @@ def convert_split(
     os.makedirs(out_dir, exist_ok=True)
     assets_dir = os.path.abspath(assets_dir or os.path.join(out_dir, '_assets'))
     exporter = Exporter(doc, assets_dir, out_dir)
+    exporter.source = pdf_path
     levels = _heading_levels(layouts)
     width = max(4, len(str(len(page_list))))
     files = {}
+    plan = []  # (layout, folder, page file path)
     running = None  # last outline entry started before the current page
     started = sorted(on_page)
     si = 0
@@ -5720,14 +5834,22 @@ def convert_split(
             k = running
         parts = entries[k][1] if k is not None else []
         folder = os.path.join(out_dir, *parts)
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, 'page_%0*d.md' % (width, lay.number))
-        exporter.md_dir = folder
-        writer = MarkdownWriter(levels)
-        _page_markdown(writer, exporter, lay)
-        with open(path, 'w', encoding='utf-8', newline='\n') as fh:
-            fh.write(writer.text())
-        files[lay.number] = path
+        plan.append((lay, folder, os.path.join(folder, 'page_%0*d.md' % (width, lay.number))))
+    for _, _, path in plan:
+        _check_output(path, pdf_path)
+    _check_output(index_path, pdf_path)
+    try:
+        for lay, folder, path in plan:
+            _CURRENT_PAGE[0] = lay.number
+            os.makedirs(folder, exist_ok=True)
+            exporter.md_dir = folder
+            writer = MarkdownWriter(levels)
+            _page_markdown(writer, exporter, lay)
+            _check_output(path, pdf_path)
+            _write_atomic(path, writer.text().encode('utf-8'))
+            files[lay.number] = path
+    finally:
+        _CURRENT_PAGE[0] = None
     rel = lambda p: _link(os.path.relpath(p, out_dir))
     title = os.path.splitext(os.path.basename(pdf_path))[0]
     lines = ['# ' + _esc(title), '']
@@ -5744,8 +5866,8 @@ def convert_split(
     else:
         for n in sorted(files):
             lines.append('- [Page %d](%s)' % (n, rel(files[n])))
-    with open(os.path.join(out_dir, 'index.md'), 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _check_output(index_path, pdf_path)
+    _write_atomic(index_path, ('\n'.join(lines) + '\n').encode('utf-8'))
     return exporter.counts, len(files), len(entries)
 
 
@@ -5775,9 +5897,11 @@ def main(argv=None):
     output directory defaults to the input name without extension. Progress goes to
     stderr unless -q is given.
 
-    An output path equal to the input file is rejected. Unexpected errors while
-    reading the file (for example MemoryError) are reported in one line with exit
-    code 2, without a traceback.
+    An output path equal to the input file is rejected here; convert() and
+    convert_split() also refuse output files that are symbolic or hard links to it.
+    Unexpected errors while reading the file (for example MemoryError) are reported in
+    one line with exit code 2, without a traceback, also when part of the output was
+    already written. Recorded problems are printed on stderr, also with -q.
 
     @param argv Argument list; None uses sys.argv.
     @return Exit status: 0 on success, 1 for usage and file errors, 2 for files that
