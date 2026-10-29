@@ -4504,7 +4504,7 @@ def image_file(doc, s, res, why=None):
     the data length. Images with a declared width or height below 1 or above
     MAX_IMAGE_SIDE, more than MAX_IMAGE_PIXELS pixels, or a declared size above twice
     the data length plus 64 KiB are not exported; the size limits also apply to JPEG
-    and JPEG 2000. A soft mask (/SMask) is reported and ignored.
+    and JPEG 2000. A soft mask (/SMask) is ignored.
 
     @param doc Document used to resolve references and decode the stream.
     @param s Image XObject stream.
