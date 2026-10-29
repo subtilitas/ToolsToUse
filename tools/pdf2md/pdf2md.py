@@ -162,6 +162,12 @@ MAX_NESTING = 256
 MAX_DECODED = 1 << 28
 ## @brief Upper limit for code, width and glyph table entries built for one font.
 MAX_FONT_ENTRIES = 1 << 20
+## @brief Upper limit in pixels for the declared width and for the height of one image
+## (65,536); larger images are not exported.
+MAX_IMAGE_SIDE = 1 << 16
+## @brief Upper limit for distinct colors cached while converting one Lab image
+## (65,536 entries); the cache is emptied when it is full.
+MAX_LAB_MEMO = 1 << 16
 ## @brief Upper limit for Form XObject runs on one page, including nested forms.
 MAX_FORM_RUNS = 2000
 ## @brief Upper limit for content stream operators executed for one page.
@@ -4072,7 +4078,8 @@ def _png(w, h, depth, ctype, data, palette=None):
     @brief Encode raw image samples as a PNG file.
 
     Each row is prefixed with filter type 0. The sample data is truncated or padded with
-    zero bytes to the exact size. IDAT data uses zlib level 6. No interlacing.
+    zero bytes to the exact size. IDAT data uses zlib level 6 and is compressed row by
+    row, so no uncompressed copy of the whole image is built. No interlacing.
 
     @param w Image width in pixels.
     @param h Image height in pixels.
@@ -4084,8 +4091,16 @@ def _png(w, h, depth, ctype, data, palette=None):
     """
     rowlen = (w * {0: 1, 2: 3, 3: 1}[ctype] * depth + 7) // 8
     need = rowlen * h
-    data = bytes(data[:need]).ljust(need, b'\0')
-    raw = b''.join(b'\0' + data[i * rowlen : (i + 1) * rowlen] for i in range(h))
+    if len(data) != need:
+        data = bytes(data[:need]).ljust(need, b'\0')
+    view = memoryview(data)
+    comp = zlib.compressobj(6)
+    parts = []
+    for i in range(h):
+        parts.append(comp.compress(b'\0'))
+        parts.append(comp.compress(view[i * rowlen : (i + 1) * rowlen]))
+    parts.append(comp.flush())
+    idat = b''.join(parts)
 
     def chunk(tag, body):
         """!
@@ -4107,7 +4122,7 @@ def _png(w, h, depth, ctype, data, palette=None):
     )
     if palette is not None:
         out += chunk(b'PLTE', palette)
-    return out + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b'')
+    return out + chunk(b'IDAT', idat) + chunk(b'IEND', b'')
 
 
 def _colorspace(doc, cs, res):
@@ -4186,6 +4201,8 @@ def _colorspace(doc, cs, res):
 
 ## @brief bytes.translate table that inverts 8-bit samples (v -> 255 - v).
 _INVERT = bytes(range(255, -1, -1))
+## @brief bytes.translate table that leaves 8-bit samples unchanged.
+_IDENTITY = bytes(range(256))
 ## @brief Images with more pixels than this (2^26, about 67 million) are not exported.
 MAX_IMAGE_PIXELS = 1 << 26
 
@@ -4207,7 +4224,105 @@ def _cmyk_to_rgb(data):
     return bytes(out)
 
 
-def image_file(doc, s, res):
+def _decode_pairs(r, decode, defaults):
+    """!
+    @brief Read the (Dmin, Dmax) pairs of an image /Decode array.
+
+    @param r Function that resolves references.
+    @param decode /Decode value, or None.
+    @param defaults Default pairs, one per color component.
+    @return List of (Dmin, Dmax) float pairs, one per component; the defaults when
+            decode is not an array of at least 2 finite numbers per component.
+    """
+    n = 2 * len(defaults)
+    if isinstance(decode, list) and len(decode) >= n:
+        try:
+            vals = [float(r(v)) for v in decode[:n]]
+        except (TypeError, ValueError):
+            vals = None
+        if vals and all(math.isfinite(v) for v in vals):
+            return [(vals[2 * i], vals[2 * i + 1]) for i in range(len(defaults))]
+    return list(defaults)
+
+
+def _decode_table(pair, maxv):
+    """!
+    @brief Build the sample mapping of one /Decode pair.
+
+    A sample v in 0..maxv maps to Dmin + v * (Dmax - Dmin) / maxv, clamped to 0..1 and
+    scaled back to 0..maxv.
+
+    @param pair (Dmin, Dmax) for a color range of 0..1.
+    @param maxv Largest sample value, 2^bits - 1.
+    @return List of maxv + 1 mapped sample values.
+    """
+    d0, d1 = pair
+    return [
+        int(round(max(0.0, min(1.0, d0 + v * (d1 - d0) / maxv)) * maxv)) for v in range(maxv + 1)
+    ]
+
+
+def _apply_decode(data, ncomp, bpc, pairs):
+    """!
+    @brief Map image samples through /Decode pairs for color ranges of 0..1.
+
+    Pairs (0, 1) leave a component unchanged and (1, 0) invert it. 8-bit samples go
+    through one 256-entry translate table per component. Below 8 bits (one component
+    only) one table maps each packed byte. 16-bit samples are inverted bytewise; other
+    16-bit intervals reduce the samples to their high byte first.
+
+    @param data Packed sample bytes, rows padded to whole bytes.
+    @param ncomp Number of color components.
+    @param bpc Bits per component: 1, 2, 4, 8 or 16.
+    @param pairs (Dmin, Dmax) per component.
+    @return Tuple (data, bpc) with the mapped samples and their bit depth; None for
+            several components below 8 bits.
+    """
+    if all(p == (0.0, 1.0) for p in pairs):
+        return data, bpc
+    if bpc < 8:
+        if ncomp != 1:
+            return None
+        maxv = (1 << bpc) - 1
+        smap = _decode_table(pairs[0], maxv)
+        tbl = bytearray(256)
+        for byte in range(256):
+            v = 0
+            for shift in range(8 - bpc, -1, -bpc):
+                v |= smap[(byte >> shift) & maxv] << shift
+            tbl[byte] = v
+        return data.translate(bytes(tbl)), bpc
+    if bpc == 16 and all(p in ((0.0, 1.0), (1.0, 0.0)) for p in pairs):
+        tables = [_INVERT if p == (1.0, 0.0) else _IDENTITY for p in pairs for _ in (0, 1)]
+    else:
+        if bpc == 16:
+            data, bpc = data[0::2], 8
+        tables = [bytes(_decode_table(p, 255)) for p in pairs]
+    if all(t == tables[0] for t in tables):
+        return data.translate(tables[0]), bpc
+    out = bytearray(data)
+    step = len(tables)
+    for i, t in enumerate(tables):
+        if t != _IDENTITY:
+            out[i::step] = data[i::step].translate(t)
+    return bytes(out), bpc
+
+
+def _why(why, kind, text):
+    """!
+    @brief Record why image_file returns no file.
+
+    @param why List that receives (kind, text), or None.
+    @param kind Problem kind for problem(): 'unsupported', 'malformed' or 'limit'.
+    @param text Cause, without the image name.
+    @return None.
+    """
+    if why is not None:
+        why.append((kind, text))
+    return None
+
+
+def image_file(doc, s, res, why=None):
     """!
     @brief Convert an image XObject to a file format.
 
@@ -4216,85 +4331,118 @@ def image_file(doc, s, res):
     Separation (1, 2, 4, 8 or 16 bits), RGB (8 or 16 bits), Lab (8 bits, converted
     with _lab_rgb), Indexed (1, 2, 4 or 8 bits, at most 2^bits palette entries) and
     CMYK (8 bits, converted to RGB). Image masks are treated as 1-bit gray.
-    A Decode array starting [1 0] inverts the samples; Separation samples are inverted
-    by default. When the color space is unknown, the component count is guessed from
-    the data length. Images with a width or height below 1, more than
-    MAX_IMAGE_PIXELS pixels, or a declared size above twice the data length plus
-    64 KiB are unsupported.
+    /Decode maps each component (see _apply_decode); Separation samples are inverted
+    after it, since a full tint is dark. Lab uses the /Decode ranges for L*, a* and b*.
+    For Indexed only the default and the reversed index range [2^bits-1 0] are
+    supported. When the color space is unknown, the component count is guessed from
+    the data length. Images with a declared width or height below 1 or above
+    MAX_IMAGE_SIDE, more than MAX_IMAGE_PIXELS pixels, or a declared size above twice
+    the data length plus 64 KiB are not exported; the size limits also apply to JPEG
+    and JPEG 2000. A soft mask (/SMask) is reported and ignored.
 
     @param doc Document used to resolve references and decode the stream.
     @param s Image XObject stream.
     @param res Resource dictionary for named color spaces.
+    @param why List that receives (kind, text) for each reason the result is None or
+           incomplete, or None.
     @return Tuple (extension, bytes) with extension 'jpg', 'jp2' or 'png'; None when
             unsupported.
     """
     r = doc.resolve
-    data, native = doc.decode(s)
+    w = r(s.get('Width', s.get('W')))
+    h = r(s.get('Height', s.get('H')))
+    if not all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (w, h)
+    ):
+        return _why(why, 'malformed', 'no valid /Width and /Height')
+    w, h = int(w), int(h)
+    if w <= 0 or h <= 0:
+        return _why(why, 'malformed', 'size %d x %d' % (w, h))
+    if w > MAX_IMAGE_SIDE or h > MAX_IMAGE_SIDE or w * h > MAX_IMAGE_PIXELS:
+        return _why(
+            why,
+            'limit',
+            'size %d x %d above MAX_IMAGE_SIDE (%d) or MAX_IMAGE_PIXELS (%d)'
+            % (w, h, MAX_IMAGE_SIDE, MAX_IMAGE_PIXELS),
+        )
+    if r(s.get('SMask')) is not None:
+        _why(why, 'unsupported', 'soft mask not applied')
+    try:
+        data, native = doc.decode(s)
+    except PDFError as exc:
+        return _why(why, 'unsupported', str(exc))
     if native in ('DCTDecode', 'DCT'):
         return ('jpg', data)
     if native == 'JPXDecode':
         return ('jp2', data)
     if native:
-        return None
-    w = int(r(s.get('Width', s.get('W'))))
-    h = int(r(s.get('Height', s.get('H'))))
+        return _why(why, 'unsupported', '%s not exported' % native)
     decode = r(s.get('Decode', s.get('D')))
-    inverted = (
-        isinstance(decode, list) and len(decode) >= 2 and r(decode[0]) == 1 and r(decode[1]) == 0
-    )
     if r(s.get('ImageMask', s.get('IM'))):
         cs, bpc = ('gray', 1), 1
     else:
-        bpc = int(r(s.get('BitsPerComponent', s.get('BPC'))) or 8)
+        bpc = r(s.get('BitsPerComponent', s.get('BPC'))) or 8
+        if isinstance(bpc, float) and bpc.is_integer():
+            bpc = int(bpc)
         cs = _colorspace(doc, s.get('ColorSpace', s.get('CS')), res)
         if cs is None:
-            n = round(len(data) * 8 / max(1, w * h * bpc))
+            n = round(len(data) * 8 / max(1, w * h * bpc)) if bpc in (1, 2, 4, 8, 16) else 0
             cs = {1: ('gray', 1), 3: ('rgb', 3), 4: ('cmyk', 4)}.get(n)
             if cs is None:
-                return None
+                return _why(why, 'unsupported', 'color space not exported')
     ncomp = cs[1]
-    if w <= 0 or h <= 0 or bpc not in (1, 2, 4, 8, 16) or w * h > MAX_IMAGE_PIXELS:
-        return None
+    if bpc not in (1, 2, 4, 8, 16):
+        return _why(why, 'malformed', '/BitsPerComponent %r' % (bpc,))
     rowlen = (w * ncomp * bpc + 7) // 8
     need = rowlen * h
     if need > 2 * len(data) + 65536:
-        return None  # far less data than the declared size: corrupt or hostile
+        # far less data than the declared size: corrupt or hostile
+        return _why(why, 'malformed', 'declared size %d x %d far above the data' % (w, h))
     data = bytes(data[:need]).ljust(need, b'\0')
     kind = cs[0]
-    if kind in ('gray', 'sep'):
-        if inverted != (kind == 'sep'):
-            data = data.translate(_INVERT)
-        return ('png', _png(w, h, bpc, 0, data))
-    elif kind == 'rgb' and bpc in (8, 16):
-        return ('png', _png(w, h, bpc, 2, data))
-    elif kind == 'lab' and bpc == 8:
-        wp, rng = cs[2], cs[3]
+    if kind == 'lab' and bpc == 8:
+        rng = cs[3]
+        d = _decode_pairs(r, decode, [(0.0, 100.0), (rng[0], rng[1]), (rng[2], rng[3])])
+        wp = cs[2]
         out = bytearray(len(data))
         memo = {}
         for i in range(0, len(data) - 2, 3):
             key = data[i : i + 3]
             v = memo.get(key)
             if v is None:
-                L, a, b = key
-                c = _lab_rgb(
-                    (
-                        L * 100 / 255.0,
-                        rng[0] + a * (rng[1] - rng[0]) / 255.0,
-                        rng[2] + b * (rng[3] - rng[2]) / 255.0,
-                    ),
-                    wp,
-                )
+                if len(memo) >= MAX_LAB_MEMO:
+                    memo.clear()
+                c = _lab_rgb([d[j][0] + key[j] * (d[j][1] - d[j][0]) / 255.0 for j in range(3)], wp)
                 v = memo[key] = bytes(int(round(x * 255)) for x in c)
             out[i : i + 3] = v
         return ('png', _png(w, h, 8, 2, bytes(out)))
-    elif kind == 'indexed' and bpc in (1, 2, 4, 8):
+    if kind == 'indexed' and bpc in (1, 2, 4, 8):
+        top = float((1 << bpc) - 1)
+        d = _decode_pairs(r, decode, [(0.0, top)])[0]
+        if d == (top, 0.0):
+            data = data.translate(_INVERT)  # bitwise NOT reverses every packed index
+        elif d != (0.0, top):
+            return _why(why, 'unsupported', 'Indexed /Decode %s not exported' % list(d))
         pal = bytearray()
         for i in range(min(cs[3], 2**bpc - 1) + 1):  # PNG allows 2^bitdepth entries
             pal += bytes(int(round(x * 255)) for x in _index_rgb(cs, i))
         return ('png', _png(w, h, bpc, 3, data, bytes(pal)))
-    elif kind == 'cmyk' and bpc == 8:
-        return ('png', _png(w, h, 8, 2, _cmyk_to_rgb(data)))
-    return None
+    if (kind in ('gray', 'sep') and ncomp == 1) or (
+        kind in ('rgb', 'cmyk') and bpc in (8, 16) and (bpc == 8 or kind == 'rgb')
+    ):
+        d = _decode_pairs(r, decode, [(0.0, 1.0)] * ncomp)
+        if kind == 'sep':  # tint 1 is full ink: gray 1 - tint
+            d = [(1.0 - a, 1.0 - b) for a, b in d]
+        mapped = _apply_decode(data, ncomp, bpc, d)
+        if mapped is None:
+            return _why(why, 'unsupported', '/Decode not exported')
+        data, bpc = mapped
+        if kind == 'cmyk':
+            return ('png', _png(w, h, 8, 2, _cmyk_to_rgb(data)))
+        return ('png', _png(w, h, bpc, 2 if kind == 'rgb' else 0, data))
+    return _why(
+        why, 'unsupported', 'color space %s with %s bits not exported' % (kind.upper(), bpc)
+    )
 
 
 def _link(rel):
@@ -4363,6 +4511,71 @@ def _family(c):
     return 'Times New Roman, serif' if c.serif else 'Helvetica, Arial, sans-serif'
 
 
+def _svg_image(m, f):
+    """!
+    @brief Build an SVG image element that places an image like the PDF Do operator.
+
+    The unit square of the image is mapped by the placement matrix m. Image row 0
+    is at the top of the unit square (y = 1), as PDF requires. The element is meant
+    for a group whose y axis points up (PDF user space).
+
+    @param m Placement matrix [a b c d e f] (CTM at the Do operator).
+    @param f Tuple (extension, bytes) with extension 'png' or 'jpg'.
+    @return SVG image element with the image as a base64 data URI.
+    """
+    mime = 'image/png' if f[0] == 'png' else 'image/jpeg'
+    return (
+        '<image width="1" height="1" preserveAspectRatio="none" '
+        'transform="matrix(%s) matrix(1 0 0 -1 0 1)" xlink:href="data:%s;base64,%s"/>'
+        % (' '.join(_fmt(v) for v in m), mime, base64.b64encode(f[1]).decode('ascii'))
+    )
+
+
+def _upright(m):
+    """!
+    @brief Tell whether an image placement shows the image in its stored orientation.
+
+    True when the x and y scales are positive and the shear terms are below 0.1 % of
+    the larger scale. Then the image file looks like the page without a transform.
+
+    @param m Placement matrix [a b c d e f].
+    @return True for an upright, unmirrored, unsheared placement.
+    """
+    a, b, c, d = m[:4]
+    tol = 1e-3 * max(abs(a), abs(d))
+    return a > 0 and d > 0 and abs(b) <= tol and abs(c) <= tol
+
+
+def image_svg(shape, f):
+    """!
+    @brief Wrap one placed image in an SVG document that applies its placement matrix.
+
+    The view is the image's bounding box on the page; width and height are in points.
+    The image is drawn rotated, mirrored or sheared as on the page (see _svg_image).
+
+    @param shape Image shape with bbox and matrix.
+    @param f Tuple (extension, bytes) with extension 'png' or 'jpg'.
+    @return SVG text ending with a newline.
+    """
+    x0, y0, x1, y1 = shape.bbox
+    w, h = x1 - x0, y1 - y0
+    return (
+        '\n'.join(
+            [
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'xmlns:xlink="http://www.w3.org/1999/xlink" '
+                'width="%spt" height="%spt" viewBox="0 0 %s %s">'
+                % (_fmt(w), _fmt(h), _fmt(w), _fmt(h)),
+                '<g transform="matrix(1 0 0 -1 %s %s)">' % (_fmt(-x0), _fmt(y1)),
+                _svg_image(shape.matrix, f),
+                '</g>',
+                '</svg>',
+            ]
+        )
+        + '\n'
+    )
+
+
 def region_svg(reg, box, raster_for):
     """!
     @brief Render a figure region as a standalone SVG document.
@@ -4407,13 +4620,7 @@ def region_svg(reg, box, raster_for):
         else:
             f = raster_for(s)
             if f and f[0] in ('png', 'jpg'):
-                mime = 'image/png' if f[0] == 'png' else 'image/jpeg'
-                m = s.matrix
-                out.append(
-                    '<image width="1" height="1" preserveAspectRatio="none" '
-                    'transform="matrix(%s) matrix(1 0 0 -1 0 1)" xlink:href="data:%s;base64,%s"/>'
-                    % (' '.join(_fmt(v) for v in m), mime, base64.b64encode(f[1]).decode('ascii'))
-                )
+                out.append(_svg_image(s.matrix, f))
     out.append('</g>')
     visible = [c for c in reg.chars if not c.invisible]
     for ln in build_lines(visible, split=0.9):
@@ -4490,9 +4697,10 @@ class Exporter:
     - assets_dir: directory that receives the figure files.
     - md_dir: directory of the Markdown file; links are relative to it.
     - cache: converted images keyed by id of the image stream; None for failures.
-    - files: (alt text, file path) of written raster images keyed by id of the image
-      stream; a repeated image reuses both.
+    - files: (alt text, file path) of written raster images keyed by (id of the image
+      stream, appearance); a repeated image with the same appearance reuses both.
     - counts: Counter of exported figures per label ('Image', 'Table', 'Figure').
+    - names: object number keyed by id of each stream object, built on first use.
     """
 
     def __init__(self, doc, assets_dir, md_dir):
@@ -4511,27 +4719,51 @@ class Exporter:
         self.md_dir = md_dir
         ## converted images keyed by id of the image stream; None for failures.
         self.cache = {}
-        ## (alt text, file path) of written raster images keyed by id of the image
-        ## stream; a repeated image reuses both.
+        ## (alt text, file path) of written raster images keyed by (id of the image
+        ## stream, appearance); a repeated image with the same appearance reuses both.
         self.files = {}
         ## Counter of exported figures per label ('Image', 'Table', 'Figure').
         self.counts = Counter()
+        ## object number keyed by id of each stream object, built on first use.
+        self.names = None
+
+    def _image_name(self, stream):
+        """!
+        @brief Name an image stream for problem reports.
+
+        @param stream Image XObject stream.
+        @return 'image N 0 R' with its object number, or 'image' for a direct object.
+        """
+        if self.names is None:
+            self.names = {
+                id(o): num for num, o in self.doc.objects.items() if isinstance(o, Stream)
+            }
+        num = self.names.get(id(stream))
+        return 'image' if num is None else 'image %d 0 R' % num
 
     def raster(self, shape):
         """!
         @brief Convert an image shape to a file format, with caching per image stream.
 
-        Any exception during conversion is caught and cached as None.
+        Each reason why the image is not exported, or exported incompletely, is
+        recorded once with problem(); an exception during conversion is recorded as
+        'internal' and cached as None.
 
         @param shape Image shape with stream and resources.
         @return Tuple (extension, bytes) from image_file, or None.
         """
         key = id(shape.stream)
         if key not in self.cache:
+            why = []
             try:
-                self.cache[key] = image_file(self.doc, shape.stream, shape.resources)
-            except Exception:
+                self.cache[key] = image_file(self.doc, shape.stream, shape.resources, why)
+            except Exception as exc:
                 self.cache[key] = None
+                why.append(
+                    ('internal', '%s: %s' % (type(exc).__name__, ' '.join(str(exc).split())))
+                )
+            for kind, text in why:
+                problem(kind, '%s: %s' % (self._image_name(shape.stream), text))
         return self.cache[key]
 
     def _write(self, name, data):
@@ -4570,9 +4802,14 @@ class Exporter:
 
         Raster regions are labelled 'Image', other regions 'Table' or 'Figure' (see
         region_label). The alt text is the label and its running number; only exported
-        figures are numbered. A raster image already written for the same stream is
-        linked again with the same file and alt text. Raster
-        files are named pNNN_imgN.ext and vector figures pNNN_<label>N.svg.
+        figures are numbered. A raster image placed upright (see _upright) is written
+        as its file; one placed rotated, mirrored or sheared, including by the page
+        rotation, is written as an SVG that applies the placement (see image_svg).
+        JPEG 2000 cannot be embedded in SVG and is written as its file; the lost
+        transform is reported. A raster image already written for the same stream and
+        the same appearance (upright, or the same linear part of the matrix) is linked
+        again with the same file and alt text. Raster files are named pNNN_imgN.ext and
+        vector figures pNNN_@<label@>N.svg. Problems are recorded for this page.
 
         @param page 1-based page number used in the file name.
         @param box Displayed page box (x0, y0, x1, y1) in points.
@@ -4580,27 +4817,56 @@ class Exporter:
         @return Markdown image link, or an HTML comment when the image encoding is
                 unsupported.
         """
-        label = 'Image' if reg.raster else region_label(reg)
-        if reg.raster:
-            key = id(reg.raster.stream)
-            if key in self.files:  # same image again: same file and number
-                alt, path = self.files[key]
+        before = _CURRENT_PAGE[0]
+        _CURRENT_PAGE[0] = page
+        try:
+            label = 'Image' if reg.raster else region_label(reg)
+            if reg.raster:
+                sh = reg.raster
+                f = self.raster(sh)
+                if f is None:
+                    return (
+                        '<!-- image on page %d not exported: unsupported image encoding -->' % page
+                    )
+                svg = f[0] in ('png', 'jpg') and not _upright(sh.matrix)
+                look = tuple(round(v, 2) for v in sh.matrix[:4]) if svg else None
+                key = (id(sh.stream), look)
+                if key in self.files:  # same image and appearance again: same file and number
+                    alt, path = self.files[key]
+                    return '![%s](%s)' % (alt, self._rel(path))
+                if not svg and not _upright(sh.matrix):
+                    problem(
+                        'unsupported',
+                        '%s: JPEG 2000 image written without its rotation, mirroring or shear'
+                        % self._image_name(sh.stream),
+                    )
+                self.counts[label] += 1
+                n = self.counts[label]
+                alt = '%s %d' % (label, n)
+                if svg:
+                    data = image_svg(sh, f).encode('utf-8')
+                    path = self._write('p%03d_img%d.svg' % (page, n), data)
+                else:
+                    path = self._write('p%03d_img%d.%s' % (page, n, f[0]), f[1])
+                self.files[key] = (alt, path)
                 return '![%s](%s)' % (alt, self._rel(path))
-            f = self.raster(reg.raster)
-            if f is None:
-                return '<!-- image on page %d not exported: unsupported image encoding -->' % page
+            for s in reg.shapes:
+                if s.kind == 'image':
+                    f = self.raster(s)
+                    if f is not None and f[0] not in ('png', 'jpg'):
+                        problem(
+                            'unsupported',
+                            '%s: JPEG 2000 image not embedded in SVG figure'
+                            % self._image_name(s.stream),
+                        )
             self.counts[label] += 1
             n = self.counts[label]
             alt = '%s %d' % (label, n)
-            path = self._write('p%03d_img%d.%s' % (page, n, f[0]), f[1])
-            self.files[key] = (alt, path)
+            svg = region_svg(reg, box, self.raster)
+            path = self._write('p%03d_%s%d.svg' % (page, label.lower(), n), svg.encode('utf-8'))
             return '![%s](%s)' % (alt, self._rel(path))
-        self.counts[label] += 1
-        n = self.counts[label]
-        alt = '%s %d' % (label, n)
-        svg = region_svg(reg, box, self.raster)
-        path = self._write('p%03d_%s%d.svg' % (page, label.lower(), n), svg.encode('utf-8'))
-        return '![%s](%s)' % (alt, self._rel(path))
+        finally:
+            _CURRENT_PAGE[0] = before
 
 
 # ---------------------------------------------------------------------------
