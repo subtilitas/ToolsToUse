@@ -162,6 +162,15 @@ MAX_NESTING = 256
 MAX_DECODED = 1 << 28
 ## @brief Upper limit for code, width and glyph table entries built for one font.
 MAX_FONT_ENTRIES = 1 << 20
+## @brief Upper limit for the characters stored in the ToUnicode values of one font
+## (4194304 characters, counted over every insertion).
+MAX_FONT_TEXT = 1 << 22
+## @brief Upper limit in characters for one ToUnicode destination string (64); longer
+## destinations are truncated.
+MAX_CMAP_DEST = 64
+## @brief Upper limit for the character codes taken from one shown string operand
+## (1048576 codes); further codes are dropped.
+MAX_SHOW_CODES = 1 << 20
 ## @brief Upper limit for Form XObject runs on one page, including nested forms.
 MAX_FORM_RUNS = 2000
 ## @brief Upper limit for content stream operators executed for one page.
@@ -1913,6 +1922,59 @@ def _clean(t):
     return ''.join(out)
 
 
+## @brief Code space ranges, as (byte count, low code, high code), of a predefined
+## CMap whose codes are all two bytes long.
+_CS_TWO = [(2, 0, 0xFFFF)]
+## @brief Code space ranges of the predefined Shift-JIS (RKSJ) CMaps.
+_CS_RKSJ = [(1, 0, 0x80), (1, 0xA0, 0xDF), (2, 0x8140, 0x9FFC), (2, 0xE040, 0xFCFC)]
+## @brief Code space ranges of the predefined EUC CMaps (EUC-H, GB-EUC, KSC-EUC, ...).
+_CS_EUC = [(1, 0, 0x80), (2, 0x8EA0, 0x8EDF), (2, 0xA1A1, 0xFEFE)]
+## @brief Code space ranges of the predefined GBK, Big Five and UHC CMaps.
+_CS_LEAD81 = [(1, 0, 0x80), (2, 0x8140, 0xFEFE)]
+## @brief Code space ranges of the predefined GBK2K CMaps (one, two and four bytes).
+_CS_GBK2K = [(1, 0, 0x80), (2, 0x8140, 0xFEFE), (4, 0x81308130, 0xFE39FE39)]
+
+
+def _predefined_codespace(name):
+    """!
+    @brief Return the code space ranges of a predefined CMap name.
+
+    Two bytes: Identity, the ISO-2022 CMaps (H, V, Ext, Add, NWP, KSC, GB, CNS1, CNS2)
+    and the Unicode UCS2 and UTF16 CMaps. Four bytes: the UTF32 CMaps. One byte:
+    Hankaku, Hiragana, Katakana, Roman and WP-Symbol. Mixed widths: RKSJ (Shift-JIS),
+    GBK2K, GBK, Big Five (B5) and UHC CMaps, then the other EUC CMaps.
+    @param name CMap name, e.g. '90ms-RKSJ-H'
+    @return list of (byte count, low code, high code), or None for an unknown name
+    """
+    base = re.sub(r'-[HV]$', '', name)
+    if re.search(r'UCS2|UTF16', name) or base in (
+        'Identity',
+        'H',
+        'V',
+        'Ext',
+        'Add',
+        'NWP',
+        'KSC',
+        'GB',
+        'CNS1',
+        'CNS2',
+    ):
+        return _CS_TWO
+    if 'UTF32' in name:
+        return [(4, 0, 0x10FFFF)]
+    if base in ('Hankaku', 'Hiragana', 'Katakana', 'Roman', 'WP-Symbol'):
+        return [(1, 0, 0xFF)]
+    if 'RKSJ' in name:
+        return _CS_RKSJ
+    if 'GBK2K' in name:
+        return _CS_GBK2K
+    if re.search(r'GBK|B5|UHC', name):
+        return _CS_LEAD81
+    if 'EUC' in name:
+        return _CS_EUC
+    return None
+
+
 class Font:
     """!
     @brief Text decoding and glyph widths of one PDF font dictionary.
@@ -1940,7 +2002,10 @@ class Font:
     - symbol: symbol table kind from the base font name ('symbol', 'zapf',
       'wingdings') or None
     - two_byte: True when every code is 2 bytes (composite fonts only)
+    - name: BaseFont name used in problem reports
     - _cache: code -> decoded text cache
+    - _text_total: characters stored into tounicode so far, compared with MAX_FONT_TEXT
+    - _limited: names of the limits already reported for this font
     """
 
     def __init__(self, doc, fd):
@@ -1952,9 +2017,12 @@ class Font:
         oblique) or flag value 64. Monospace from the name (courier, mono, consol, menlo,
         typewriter, cmtt) or flag value 1. Serif from the name, unless it contains "sans".
         Default width: 600 for monospace, 500 otherwise, in 1/1000 em.
-        A ToUnicode stream is parsed first; parse errors are ignored.
-        Type0 fonts: an embedded encoding CMap fills codespace and cidmap; a predefined
-        UCS2 or UTF16 CMap name sets unicode_codes. Without any text mapping, the cmap
+        A ToUnicode stream is parsed first; a parse error is recorded as 'malformed'.
+        Type0 fonts: an embedded encoding CMap fills codespace and cidmap. A predefined
+        CMap name sets the code space of its family (see _predefined_codespace); UCS2,
+        UTF16 and UTF32 names also set unicode_codes. An unknown name keeps the code
+        space of the ToUnicode CMap, or, without one, reads two-byte codes and records
+        an 'unsupported' problem. Without any text mapping, the cmap
         table of an embedded TrueType program (FontFile2) of the descendant font is
         used, through the CIDToGIDMap stream when present. Widths come from DW (default
         1000) and the W array; a range in W covers at most 65536 codes.
@@ -2022,12 +2090,18 @@ class Font:
         self.symbol = _symbol_kind(base)
         ## code -> decoded text cache
         self._cache = {}
+        ## BaseFont name used in problem reports
+        self.name = base or '(unnamed)'
+        ## characters stored into tounicode so far, compared with MAX_FONT_TEXT
+        self._text_total = 0
+        ## names of the limits already reported for this font
+        self._limited = set()
         tu = r(fd.get('ToUnicode'))
         if isinstance(tu, Stream):
             try:
                 self._parse_cmap(doc.decoded(tu))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._bad('ToUnicode CMap', exc)
         if isinstance(desc, dict):
             ff = r(desc.get('FontFile')) or r(desc.get('FontFile2'))
         else:
@@ -2042,13 +2116,20 @@ class Font:
                 self.codespace = []
                 try:
                     self._parse_cmap(doc.decoded(enc), encoding=True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._bad('encoding CMap', exc)
             elif isinstance(enc, str):
-                # predefined CMap (Identity-H/V, UCS-2, UTF-16): 2-byte codes; a code space
-                # declared in the ToUnicode CMap does not apply
-                self.codespace = []
-                self.unicode_codes = bool(re.search(r'UCS2|UTF16', enc))
+                # predefined CMap: its own code space replaces the one declared in the
+                # ToUnicode CMap; an unknown name keeps the ToUnicode code space
+                cs = _predefined_codespace(enc)
+                if cs is not None:
+                    self.codespace = list(cs)
+                elif not self.codespace:
+                    problem(
+                        'unsupported',
+                        'font %s: encoding %s parsed as two-byte codes' % (self.name, enc),
+                    )
+                self.unicode_codes = bool(re.search(r'UCS2|UTF16|UTF32', enc))
             if not self.tounicode and not self.unicode_codes:
                 # no text mapping: try the cmap table of an embedded TrueType program
                 ddesc = r(dsc.get('FontDescriptor'))
@@ -2059,14 +2140,18 @@ class Font:
                         c2g = r(dsc.get('CIDToGIDMap'))
                         c2g = doc.decoded(c2g) if isinstance(c2g, Stream) else None
                         if c2g:
-                            for cid in range(len(c2g) // 2):
+                            n = len(c2g) // 2
+                            if n > MAX_FONT_ENTRIES:
+                                n = MAX_FONT_ENTRIES
+                                self._limit('MAX_FONT_ENTRIES (CIDToGIDMap)')
+                            for cid in range(n):
                                 gid = (c2g[2 * cid] << 8) | c2g[2 * cid + 1]
                                 if gid in gids:
                                     self.cid_text[cid] = gids[gid]
                         else:  # /Identity: CID = glyph id
                             self.cid_text = gids
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._bad('TrueType cmap', exc)
             dw = r(dsc.get('DW'))
             self.default_width = float(dw) if isinstance(dw, (int, float)) else 1000.0
             w = r(dsc.get('W'))
@@ -2094,6 +2179,8 @@ class Font:
                     i += 3
                 else:
                     break
+            if len(self.widths) >= MAX_FONT_ENTRIES and i < len(w):
+                self._limit('MAX_FONT_ENTRIES (W)')
             ## True when every code is 2 bytes (composite fonts only)
             self.two_byte = not self.codespace or all(n == 2 for n, _, _ in self.codespace)
         else:
@@ -2110,7 +2197,12 @@ class Font:
                         self.fmat = [v / det for v in fm] + [0.0, 0.0]
             fc = r(fd.get('FirstChar'))
             fc = fc if isinstance(fc, int) else 0
-            for i, x in enumerate(r(fd.get('Widths')) or []):
+            ws = r(fd.get('Widths'))
+            ws = ws if isinstance(ws, list) else []
+            if len(ws) > MAX_FONT_ENTRIES:
+                ws = ws[:MAX_FONT_ENTRIES]
+                self._limit('MAX_FONT_ENTRIES (Widths)')
+            for i, x in enumerate(ws):
                 x = r(x)
                 if isinstance(x, (int, float)):
                     self.widths[fc + i] = float(x) * scale
@@ -2139,7 +2231,8 @@ class Font:
                     ):
                         try:
                             builtin = _type1_encoding(doc.decoded(ff))
-                        except Exception:
+                        except Exception as exc:
+                            self._bad('Type 1 font program', exc)
                             builtin = None
                     if builtin is None:
                         basename = 'StandardEncoding'
@@ -2157,8 +2250,50 @@ class Font:
                     elif isinstance(x, Name):
                         ch = glyph_char(str(x))
                         if ch is not None:
-                            self.encoding[code] = ch
+                            if len(self.encoding) < MAX_FONT_ENTRIES or code in self.encoding:
+                                self.encoding[code] = ch
+                            else:
+                                self._limit('MAX_FONT_ENTRIES (Differences)')
                         code += 1
+
+    def _bad(self, what, exc):
+        """!
+        @brief Record a font part that could not be read as a 'malformed' problem.
+        @param what name of the part, e.g. 'ToUnicode CMap'
+        @param exc the exception raised while reading it
+        """
+        problem(
+            'malformed', 'font %s: %s not readable (%s)' % (self.name, what, type(exc).__name__)
+        )
+
+    def _limit(self, which):
+        """!
+        @brief Record once per font that a limit cut the font data.
+        @param which name of the limit, e.g. 'MAX_FONT_TEXT'
+        """
+        if which not in self._limited:
+            self._limited.add(which)
+            problem('limit', 'font %s: %s limit reached' % (self.name, which))
+
+    def _put_text(self, code, u):
+        """!
+        @brief Store the text of one code in tounicode within the font limits.
+
+        Fails when tounicode holds MAX_FONT_ENTRIES codes and code is new, or when
+        MAX_FONT_TEXT characters have been stored; the limit is then reported once.
+        @param code character code
+        @param u text, at most MAX_CMAP_DEST characters
+        @return True when stored, False when a limit was reached
+        """
+        if len(self.tounicode) >= MAX_FONT_ENTRIES and code not in self.tounicode:
+            self._limit('MAX_FONT_ENTRIES (ToUnicode)')
+            return False
+        if self._text_total + len(u) > MAX_FONT_TEXT:
+            self._limit('MAX_FONT_TEXT')
+            return False
+        self._text_total += len(u)
+        self.tounicode[code] = u
+        return True
 
     def _parse_cmap(self, data, encoding=False):
         """!
@@ -2170,6 +2305,9 @@ class Font:
         As an encoding CMap (encoding=True): codespace ranges fill codespace, cidrange
         and cidchar entries fill cidmap.
         Ranges wider than 65536 codes are skipped (bfrange) or truncated (cidrange).
+        Destinations are cut to MAX_CMAP_DEST characters. tounicode and cidmap stop
+        growing at MAX_FONT_ENTRIES codes, and tounicode at MAX_FONT_TEXT characters
+        stored; each cut is reported once per font as a 'limit' problem.
         @param data decoded CMap stream bytes
         @param encoding True to read an embedded encoding CMap instead of a ToUnicode CMap
         """
@@ -2195,20 +2333,26 @@ class Font:
                         if isinstance(lo, bytes) and isinstance(hi, bytes) and isinstance(cid, int):
                             lo, hi = int.from_bytes(lo, 'big'), int.from_bytes(hi, 'big')
                             room = MAX_FONT_ENTRIES - len(self.cidmap)
+                            if hi - lo >= room:
+                                self._limit('MAX_FONT_ENTRIES (cidrange)')
                             for k in range(min(hi - lo, 65535, room - 1) + 1):
                                 self.cidmap[lo + k] = cid + k
                 elif encoding and kw == 'endcidchar':
                     for i in range(0, len(ops) - 1, 2):
                         src, cid = ops[i], ops[i + 1]
                         if isinstance(src, bytes) and isinstance(cid, int):
-                            self.cidmap[int.from_bytes(src, 'big')] = cid
+                            src = int.from_bytes(src, 'big')
+                            if len(self.cidmap) < MAX_FONT_ENTRIES or src in self.cidmap:
+                                self.cidmap[src] = cid
+                            else:
+                                self._limit('MAX_FONT_ENTRIES (cidchar)')
                 elif kw == 'endbfchar':
                     for i in range(0, len(ops) - 1, 2):
                         src, dst = ops[i], ops[i + 1]
                         if isinstance(src, bytes):
                             u = self._u(dst)
-                            if u is not None:
-                                self.tounicode[int.from_bytes(src, 'big')] = u
+                            if u is not None and not self._put_text(int.from_bytes(src, 'big'), u):
+                                break
                 elif kw == 'endbfrange':
                     for i in range(0, len(ops) - 2, 3):
                         lo, hi, dst = ops[i], ops[i + 1], ops[i + 2]
@@ -2217,19 +2361,18 @@ class Font:
                         lo, hi = int.from_bytes(lo, 'big'), int.from_bytes(hi, 'big')
                         if hi < lo or hi - lo > 65535:
                             continue
-                        hi = min(hi, lo + MAX_FONT_ENTRIES - len(self.tounicode) - 1)
                         if isinstance(dst, list):
                             for j, x in enumerate(dst[: hi - lo + 1]):
                                 u = self._u(x)
-                                if u is not None:
-                                    self.tounicode[lo + j] = u
+                                if u is not None and not self._put_text(lo + j, u):
+                                    break
                         elif isinstance(dst, bytes):
                             u = self._u(dst)
                             if u:
                                 last = ord(u[-1])
-                                for k in range(hi - lo + 1):
-                                    if last + k <= 0x10FFFF:
-                                        self.tounicode[lo + k] = u[:-1] + chr(last + k)
+                                for k in range(min(hi - lo, 0x10FFFF - last) + 1):
+                                    if not self._put_text(lo + k, u[:-1] + chr(last + k)):
+                                        break
                 ops = []
             else:
                 ops.append(lx.build(t))
@@ -2240,7 +2383,7 @@ class Font:
         @brief Decode a CMap destination string to text.
 
         A 1-byte string maps to the character with that code. Longer strings decode as
-        UTF-16BE, with U+FFFD for invalid data.
+        UTF-16BE, with U+FFFD for invalid data, and are cut to MAX_CMAP_DEST characters.
         @param dst destination value from the CMap
         @return decoded string, or None when dst is not bytes
         """
@@ -2248,7 +2391,7 @@ class Font:
             return None
         if len(dst) == 1:
             return chr(dst[0])
-        return dst.decode('utf-16-be', errors='replace')
+        return dst[: 4 * MAX_CMAP_DEST].decode('utf-16-be', errors='replace')[:MAX_CMAP_DEST]
 
     def codes(self, s):
         """!
@@ -2259,16 +2402,40 @@ class Font:
         padded with a zero low byte.
         Other composite fonts: the shortest prefix of 1 to 4 bytes that lies in a
         codespace range; when none matches, one byte.
+        Codes are produced one at a time. After MAX_SHOW_CODES codes the rest of the
+        string is dropped and a 'limit' problem is recorded.
         @param s string operand bytes
-        @return list of (code, byte count) tuples
+        @return iterator of (code, byte count) tuples
         """
         if not self.cid:
-            return [(b, 1) for b in s]
-        if self.two_byte:
-            return [
+            it = ((b, 1) for b in s)
+        elif self.two_byte:
+            it = (
                 ((s[i] << 8) | (s[i + 1] if i + 1 < len(s) else 0), 2) for i in range(0, len(s), 2)
-            ]
-        out = []
+            )
+        else:
+            it = self._var_codes(s)
+        k = 0
+        for item in it:
+            if k >= MAX_SHOW_CODES:
+                problem(
+                    'limit',
+                    'font %s: string of %d bytes cut at MAX_SHOW_CODES (%d codes)'
+                    % (self.name, len(s), MAX_SHOW_CODES),
+                )
+                return
+            k += 1
+            yield item
+
+    def _var_codes(self, s):
+        """!
+        @brief Split a string into variable-width codes using the code space ranges.
+
+        Each code is the shortest prefix of 1 to 4 bytes that lies in a codespace
+        range; when none matches, one byte.
+        @param s string operand bytes
+        @return iterator of (code, byte count) tuples
+        """
         i = 0
         while i < len(s):
             for n in (1, 2, 3, 4):
@@ -2278,9 +2445,8 @@ class Font:
             else:
                 n = 1
                 c = s[i]
-            out.append((c, n))
+            yield c, n
             i += n
-        return out
 
     def text(self, code):
         """!
