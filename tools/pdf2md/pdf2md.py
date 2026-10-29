@@ -26,16 +26,38 @@ python pdf2md.py input.pdf --split-pages --flat  # page files without folders
   and Arabic presentation forms are replaced by their base characters
   (Unicode normalization form NFKC).
 - Vector graphics (ruled tables, diagrams, charts) become SVG files that also
-  contain the text inside their area. Raster images become PNG, JPEG or
-  JPEG 2000 files. Each figure is linked from the Markdown at its position in
-  reading order. Frames and fills that span a whole text box (boxed notes,
-  form fields) stay text.
+  contain the text inside their area. Each figure is linked from the Markdown
+  at its position in reading order. Frames and fills that span a whole text box
+  (boxed notes, form fields) stay text.
+- A figure that is a single raster image placed upright (positive x and y
+  scale, no shear) is written as PNG, JPEG or JPEG 2000. An image that is
+  rotated, mirrored or sheared, also by the page /Rotate, is written as an SVG
+  that embeds the PNG or JPEG data and applies the placement matrix. A JPEG 2000
+  image is always written as its own file; a rotation, mirroring or shear of it
+  is reported as a problem. Image /Decode arrays are applied per component; a
+  16-bit RGB image with a /Decode other than [0 1] or [1 0] per component is
+  written with 8 bits per component.
 - Text of visible annotation appearances (filled-in form fields, free text,
   stamps) is included. Their borders and backgrounds are not.
 - Pages with /Rotate are read as displayed. When most text on a rotated page
   is not upright as displayed, the page is read unrotated.
-- Lines and figures that repeat at the same place on at least 50 % of the
-  pages (minimum 3 pages) are treated as page headers or footers and dropped.
+- Lines in the top or bottom 10 % of the page box that repeat (digits ignored)
+  on at least 50 % of the pages, minimum 3 pages, are page headers or footers
+  and are dropped. A figure is dropped only when it lies wholly inside one of
+  these bands and the same figure (same rounded position, same shapes and image
+  data, same text with digits ignored) occurs there on that many pages. Figures
+  elsewhere, including full-page scans, are kept.
+- Objects are read through the cross-reference chain from the last startxref
+  (tables, cross-reference streams, /XRefStm, /Prev). The newest revision wins,
+  free entries are ignored, and a reference with a different generation number
+  is null. In a hybrid file, an /XRefStm entry replaces a free entry of the same
+  section's table. When the chain is unreadable, objects are recovered by scanning the
+  file; this is reported as a problem unless only the byte offsets have shifted.
+- Output files are written to a temporary file (.~ plus 8 hex digits plus .tmp)
+  in the same directory and moved into place with os.replace(), retried up to 5
+  times within about 1.5 s on Windows when the file is locked. A failed run
+  keeps an existing file unchanged, and a symbolic link at an output path is
+  replaced, not written through.
 
 @par One file per page (--split-pages)
 - Each page becomes page_NNNN.md. index.md lists the contents with links.
@@ -56,20 +78,50 @@ Python 3.8 or later. No third-party packages. No network access.
 @par Exit codes
 - 0: success.
 - 1: usage error (unknown option, invalid --pages, no selected page in the
-  document, output path equal to the input) or a file system error.
+  document, an output path that is the input file or a symbolic or hard link to
+  it) or a file system error. Markdown, page and index.md paths are checked
+  before any file is written; figure paths when they are written.
 - 2: the file cannot be parsed or is encrypted, or the conversion failed
   (reported in one line, without a traceback).
+- 3: the output was written but is incomplete. Each problem is printed on stderr
+  as one line with page number, kind and cause, also with -q (see problem()).
+  Kinds: unsupported (feature not handled), malformed (damaged input), limit
+  (a resource limit cut the output), internal (unexpected exception). Causes
+  include a failing content operator, Form XObject, font or annotation, a
+  stream that cannot be decoded, an image that is not exported, and every limit
+  below. Identical problems are listed once with a repeat count; at most
+  MAX_PROBLEMS = 1000 distinct problems are listed.
 
 @par Resource limits
 Hostile or damaged files are bounded by these limits; output of a file that
 hits one is incomplete.
-- One decoded stream: MAX_DECODED = 256 MiB. Peak memory for such a stream is
-  about twice that.
-- Images: at most MAX_IMAGE_PIXELS = 2^26 pixels, and a declared size of at most
-  twice the stored data plus 64 KiB; others are not exported.
-- One page: MAX_PAGE_OPS = 5,000,000 content stream operators and
-  MAX_FORM_RUNS = 2000 Form XObject runs.
-- One font: MAX_FONT_ENTRIES = 2^20 code, width and glyph table entries.
+- One decoded stream: MAX_DECODED = 256 MiB, checked after every filter stage
+  and inside the Flate, LZW, ASCII85, ASCIIHex, RunLength and predictor
+  decoders. Peak memory for such a stream is about twice that.
+- Decoded-stream cache: MAX_DOC_DECODED = 1 GiB per document. Streams decoded
+  after that are not cached and are decoded again on each use.
+- LZW dictionary: MAX_LZW_TABLE = 4096 entries; a full dictionary stops growing
+  until a clear code.
+- Images: at most MAX_IMAGE_SIDE = 65,536 pixels per side and
+  MAX_IMAGE_PIXELS = 2^26 pixels, checked on the declared /Width and /Height
+  before decoding, also for JPEG and JPEG 2000, and a declared size of at most
+  twice the stored data plus 64 KiB; others are not exported. The Lab color
+  cache holds at most MAX_LAB_MEMO = 65,536 entries per image.
+- One page: MAX_PAGE_OPS = 5,000,000 content stream operators,
+  MAX_FORM_RUNS = 2000 Form XObject runs, Form XObjects nested at most 12
+  levels deep, and MAX_PAGE_CHARS = 1,000,000 characters.
+- One cross-reference stream: at most min(/Size, file length in bytes,
+  MAX_XREF_ENTRIES = 8,388,607) entries.
+- One page: MAX_PAGE_CODES = 2,000,000 character codes shown, including codes
+  that produce no character.
+- Figure clustering: GRID_LEVELS = 8 grid levels with cells of 64 pt x 32^k;
+  each box goes into the lowest level where it occupies at most
+  MAX_GRID_CELLS = 1024 cells.
+- One font: MAX_FONT_ENTRIES = 2^20 entries in each table (ToUnicode and
+  encoding CMap codes, W and Widths, Differences, CIDToGIDMap glyphs),
+  MAX_FONT_TEXT = 2^22 characters of ToUnicode text counted over every
+  insertion, and MAX_CMAP_DEST = 64 characters per ToUnicode destination.
+- One shown string operand: MAX_SHOW_CODES = 2^20 character codes.
 - Arrays and dictionaries nested deeper than MAX_NESTING = 256 levels are skipped.
 - Text more than 10 % of the page size outside the page box is dropped.
 - With --split-pages, page file paths relative to the output directory stay
@@ -100,6 +152,14 @@ definition. Code blocks use a fence longer than any backtick run inside.
   (character identifier (CID) fonts). Fonts that name glyphs only by number
   (g18, g152) and have none of these decode to wrong characters. Unmappable
   CID glyphs are written as U+FFFD.
+- Predefined CMaps of composite fonts are read with the code space of their
+  family (Identity, ISO-2022 including 78 and GBT, UCS2, UTF16, UTF32, RKSJ,
+  EUC, GBK, GBK2K, Big Five, UHC, Johab, one-byte CMaps). The code-space tables
+  are family approximations, not the Adobe CMap files; Johab uses the UHC
+  ranges. The predefined CID-to-Unicode mappings are not included, so text comes
+  from ToUnicode or the embedded TrueType cmap. UTF8 and other unknown CMap
+  names use the ToUnicode code space, or two-byte codes with an unsupported
+  problem when there is none.
 - Vertical writing mode (Identity-V) is read as horizontal text.
 - Type 3 glyph size is taken from the font size. The glyph space em is unknown.
 - Fonts without a /Widths array use built-in widths for codes 32-126 of
@@ -107,10 +167,17 @@ definition. Code blocks use a fence longer than any backtick run inside.
   Word gaps in that text can be misdetected and its SVG text is not
   width-fitted.
 - Rotated text outside figures is dropped.
-- Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI) and
-  soft-mask transparency are not exported. Lab colors and images are converted
-  to sRGB without chromatic adaptation, so colors with a D50 white point are
-  slightly shifted.
+- Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI), and Indexed
+  images with a /Decode other than the default or [2^bits-1 0] are not exported
+  and are reported. Inline images are reported only when figures are exported
+  (no --no-figures), outside annotation appearances, and when placed at 1 pt or
+  more; inline images in a header or footer band are reported too. Soft-mask
+  transparency (/SMask) is ignored without a report; the image is exported
+  opaque. Lab colors and images are converted to sRGB without chromatic
+  adaptation, so colors with a D50 white point are slightly shifted.
+- When the cross-reference chain has one bad offset, the whole file is read by
+  scanning. The scan does not apply free entries, so an object freed in a later
+  revision can still be read; this case is reported as a problem.
 - SVG text uses generic font families, stretched to the original run width.
 """
 
@@ -121,6 +188,7 @@ import os
 import re
 import struct
 import sys
+import time
 import unicodedata
 import zlib
 from collections import Counter
@@ -156,14 +224,95 @@ _OPS = {}
 MAX_REL_PATH = 160
 ## @brief Arrays and dictionaries nested deeper than this are skipped (parsed as None).
 MAX_NESTING = 256
-## @brief Upper limit in bytes for one decoded stream. Longer output is cut off.
+## @brief Upper limit in bytes for one decoded stream (256 MiB), checked after every
+## filter stage and inside the expanding decoders. Longer output is cut off.
 MAX_DECODED = 1 << 28
+## @brief Upper limit in bytes for all decoded streams cached by one Document (1 GiB).
+## Streams decoded after the cache is full are returned without being cached.
+MAX_DOC_DECODED = 1 << 30
+## @brief Upper limit for LZWDecode dictionary entries (4096, the 12-bit code space).
+## A full dictionary stops growing until a clear code.
+MAX_LZW_TABLE = 4096
 ## @brief Upper limit for code, width and glyph table entries built for one font.
 MAX_FONT_ENTRIES = 1 << 20
+## @brief Upper limit for the characters stored in the ToUnicode values of one font
+## (4194304 characters, counted over every insertion).
+MAX_FONT_TEXT = 1 << 22
+## @brief Upper limit in characters for one ToUnicode destination string (64); longer
+## destinations are truncated.
+MAX_CMAP_DEST = 64
+## @brief Upper limit for the character codes taken from one shown string operand
+## (1048576 codes); further codes are dropped.
+MAX_SHOW_CODES = 1 << 20
+## @brief Upper limit in pixels for the declared width and for the height of one image
+## (65,536); larger images are not exported.
+MAX_IMAGE_SIDE = 1 << 16
+## @brief Upper limit for distinct colors cached while converting one Lab image
+## (65,536 entries); the cache is emptied when it is full.
+MAX_LAB_MEMO = 1 << 16
 ## @brief Upper limit for Form XObject runs on one page, including nested forms.
 MAX_FORM_RUNS = 2000
 ## @brief Upper limit for content stream operators executed for one page.
 MAX_PAGE_OPS = 5000000
+## @brief Upper limit for characters (Char objects) collected for one page: 1,000,000.
+##
+## A dense text page holds about 10,000. Further glyphs are not collected.
+MAX_PAGE_CHARS = 1000000
+## @brief Upper limit for character codes shown on one page (2,000,000), counting codes
+## that produce no Char (empty text or a size under 1 point). Further codes are skipped.
+MAX_PAGE_CODES = 2000000
+## @brief Upper limit for grid cells that one box may occupy while clustering: 1024 cells.
+##
+## A level-0 cell is at least 64 x 64 points. A larger box goes into a coarser grid
+## level (see _merge_pass).
+MAX_GRID_CELLS = 1024
+## @brief Upper limit for the entries read from one cross-reference stream (8,388,607,
+## the largest object number PDF 1.7 allows); /Size and the file length bound it too.
+MAX_XREF_ENTRIES = 8388607
+## @brief Number of grid levels in figure clustering (cells of 64 pt x 32^k for level k
+## = 0..7, up to about 2.2e12 pt); larger boxes are not merged with other boxes.
+GRID_LEVELS = 8
+## @brief Upper limit for distinct entries kept in PROBLEMS; further ones are only counted.
+MAX_PROBLEMS = 1000
+## @brief Problems that made the output of the running conversion incomplete.
+##
+## Maps (page number or None, kind, text) to the number of occurrences, in insertion
+## order. kind is 'unsupported', 'malformed', 'limit' or 'internal'. analyze() clears
+## it; main() prints it and returns exit code 3 when it is not empty.
+PROBLEMS = {}
+## @brief One-element list with the page number that problem() attaches; None outside
+## a page.
+_CURRENT_PAGE = [None]
+
+
+def problem(kind, text):
+    """!
+    @brief Record a problem that makes the output incomplete.
+
+    Identical entries are counted once with a repeat count. After MAX_PROBLEMS
+    distinct entries, new ones go to a single overflow entry.
+    @param kind 'unsupported' (feature not handled), 'malformed' (damaged input),
+           'limit' (a MAX_* limit cut the output) or 'internal' (unexpected exception)
+    @param text one line that names the object and the cause, e.g. 'image 12 0 R: JBIG2Decode'
+    """
+    key = (_CURRENT_PAGE[0], kind, text)
+    if key not in PROBLEMS and len(PROBLEMS) >= MAX_PROBLEMS:
+        key = (None, 'limit', 'more problems not listed')
+    PROBLEMS[key] = PROBLEMS.get(key, 0) + 1
+
+
+def problem_lines():
+    """!
+    @brief Format PROBLEMS for stderr.
+    @return list of lines such as 'page 3: unsupported: image 12 0 R: JBIG2Decode (x2)'
+    """
+    out = []
+    for (page, kind, text), n in PROBLEMS.items():
+        where = 'page %d: ' % page if page is not None else ''
+        out.append('%s%s: %s%s' % (where, kind, text, ' (x%d)' % n if n > 1 else ''))
+    return out
+
+
 ## @brief Pattern for the EI keyword that ends inline image data.
 ##
 ## EI must follow a whitespace byte and be followed by whitespace or the end of data.
@@ -217,21 +366,38 @@ class Stream:
     @par Attributes
     - dict: the stream dictionary.
     - raw: the stream bytes as stored in the file, still encoded.
+    - num: object number, or None for a stream that is not an indirect object.
+    - gen: generation number, or None like num.
     """
 
     ## Attribute names; each is described in the class documentation.
-    __slots__ = ('dict', 'raw')
+    __slots__ = ('dict', 'raw', 'num', 'gen')
 
-    def __init__(self, dct, raw):
+    def __init__(self, dct, raw, num=None, gen=None):
         """!
         @brief Store the stream dictionary and its raw bytes.
         @param dct stream dictionary.
         @param raw undecoded stream bytes.
+        @param num object number, or None.
+        @param gen generation number, or None.
         """
         ## the stream dictionary.
         self.dict = dct
         ## the stream bytes as stored in the file, still encoded.
         self.raw = raw
+        ## object number, or None for a stream that is not an indirect object.
+        self.num = num
+        ## generation number, or None like num.
+        self.gen = gen
+
+    def label(self):
+        """!
+        @brief Name the stream for problem() messages.
+        @return 'stream N G R', or 'stream' when the object number is not known.
+        """
+        if self.num is None:
+            return 'stream'
+        return 'stream %d %d R' % (self.num, self.gen or 0)
 
     def get(self, key, default=None):
         """!
@@ -535,7 +701,8 @@ def _predict(data, parms):
     Predictor 2 (TIFF) is undone only for 8 bits per component, else data is unchanged.
     Any predictor above 2 is read as PNG rows: one filter-type byte, then the row.
     PNG filter types 1 (Sub), 2 (Up), 3 (Average) and 4 (Paeth) are undone; other
-    types copy the row. A short last row is padded with zero bytes.
+    types copy the row. A short last row is padded with zero bytes. Output stops at
+    MAX_DECODED bytes.
     @param data decoded filter output.
     @param parms decode parameter dictionary (Predictor, Colors, BitsPerComponent, Columns).
     @return the reconstructed bytes.
@@ -591,6 +758,9 @@ def _predict(data, parms):
                 row[j] = (row[j] + pr) & 0xFF
         out += row
         prev = row
+        if len(out) >= MAX_DECODED:
+            del out[MAX_DECODED:]
+            break
     return bytes(out)
 
 
@@ -600,7 +770,9 @@ def _lzw(data, parms):
 
     Codes start at 9 bits and grow to at most 12 bits. Code 256 clears the table and
     code 257 ends the data. /EarlyChange (default 1) sets when the code width grows.
-    An invalid code ends decoding and returns the output so far.
+    The dictionary holds at most MAX_LZW_TABLE entries; when it is full, no entries are
+    added until a clear code. An invalid code ends decoding and returns the output so
+    far. Output stops at MAX_DECODED bytes.
     @param data compressed bytes.
     @param parms decode parameter dictionary, or another value for defaults.
     @return the decoded bytes.
@@ -628,8 +800,9 @@ def _lzw(data, parms):
                 entry = table[code]
             elif code < len(table):
                 entry = table[code]
-                table.append(prev + entry[:1])
-            elif code == len(table):
+                if len(table) < MAX_LZW_TABLE:
+                    table.append(prev + entry[:1])
+            elif code == len(table) and code < MAX_LZW_TABLE:
                 entry = prev + prev[:1]
                 table.append(entry)
             else:
@@ -647,9 +820,12 @@ def _a85(data):
     """!
     @brief Decode ASCII85Decode data.
 
-    Whitespace is removed, a leading <~ is skipped and the data ends at ~>.
+    Whitespace is removed, a leading <~ is skipped and the data ends at ~>. Input that
+    could expand beyond MAX_DECODED bytes (z stands for 4 bytes) is decoded in pieces,
+    and output stops at MAX_DECODED bytes.
     @param data encoded bytes.
     @return the decoded bytes.
+    @exception ValueError when the data holds bytes that are not ASCII85.
     """
     data = re.sub(rb'\s', b'', data)
     if data.startswith(b'<~'):
@@ -657,7 +833,21 @@ def _a85(data):
     end = data.find(b'~>')
     if end >= 0:
         data = data[:end]
-    return base64.a85decode(data)
+    zs = data.count(b'z')
+    if 4 * zs + len(data) - zs <= MAX_DECODED:
+        return base64.a85decode(data)
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n and len(out) < MAX_DECODED:
+        j = min(n, i + (1 << 20))
+        groups = (j - i) - data.count(b'z', i, j)  # characters outside z, in 5-byte groups
+        while groups % 5 and j < n:
+            groups += data[j] != 0x7A
+            j += 1
+        out += base64.a85decode(data[i:j])
+        i = j
+    del out[MAX_DECODED:]
+    return bytes(out)
 
 
 def _ahx(data):
@@ -665,14 +855,14 @@ def _ahx(data):
     @brief Decode ASCIIHexDecode data.
 
     The data ends at the first >. Non-hex bytes are ignored and an odd digit count is
-    padded with 0.
+    padded with 0. Output stops at MAX_DECODED bytes.
     @param data encoded bytes.
     @return the decoded bytes.
     """
     end = data.find(b'>')
     if end >= 0:
         data = data[:end]
-    hx = re.sub(rb'[^0-9A-Fa-f]', b'', data)
+    hx = re.sub(rb'[^0-9A-Fa-f]', b'', data)[: 2 * MAX_DECODED]
     if len(hx) % 2:
         hx += b'0'
     return bytes.fromhex(hx.decode('ascii'))
@@ -683,7 +873,7 @@ def _rld(data):
     @brief Decode RunLengthDecode data.
 
     A length byte below 128 copies the next length+1 bytes. A byte above 128 repeats
-    the next byte 257-length times. 128 ends the data.
+    the next byte 257-length times. 128 ends the data. Output stops at MAX_DECODED bytes.
     @param data encoded bytes.
     @return the decoded bytes.
     """
@@ -711,29 +901,70 @@ def _rld(data):
 IMAGE_FILTERS = {'DCTDecode', 'DCT', 'JPXDecode', 'JBIG2Decode', 'CCITTFaxDecode', 'CCF'}
 
 
+def _size_text(n):
+    """!
+    @brief Format a byte count for problem() messages.
+    @param n number of bytes.
+    @return text such as '256 MiB', or '1000 bytes' when n is not a whole number of MiB.
+    """
+    if n >= 1 << 20 and n % (1 << 20) == 0:
+        return '%d MiB' % (n >> 20)
+    return '%d bytes' % n
+
+
+def _one_line(exc):
+    """!
+    @brief Describe an exception in one line for problem() messages.
+    @param exc the exception.
+    @return the exception message with runs of whitespace collapsed, or its type name
+    when the message is empty.
+    """
+    return ' '.join(str(exc).split()) or type(exc).__name__
+
+
 # ---------------------------------------------------------------------------
 # Document
 # ---------------------------------------------------------------------------
 
 ## @brief Pattern for an "num gen obj" object header not preceded by a digit.
 _OBJ_RE = re.compile(rb'(?<![0-9])(\d+)\s+(\d+)\s+obj\b')
+## @brief Pattern for the object header that a cross-reference offset points to.
+##
+## Leading whitespace is allowed. Group 1: object number. Group 2: generation number.
+_XOBJ_RE = re.compile(rb'\s*(\d+)\s+(\d+)\s+obj\b')
 ## @brief Pattern for the start of a trailer dictionary.
 _TRAILER_RE = re.compile(rb'trailer\s*<<')
+## @brief Pattern for the xref keyword that starts a cross-reference table.
+_XREF_RE = re.compile(rb'(?<![A-Za-z])xref\s')
+## @brief Pattern for the last startxref keyword and the offset after it (group 1).
+_STARTXREF_RE = re.compile(rb'startxref\s+(\d+)')
+## @brief Pattern for a cross-reference subsection header "first count".
+_XSUB_RE = re.compile(rb'\s*(\d+)\s+(\d+)(?=\s)')
+## @brief Pattern for one cross-reference table entry "offset generation n" or "... f".
+_XENT_RE = re.compile(rb'\s*(\d+)\s+(\d+)\s+([nf])')
 
 
 class Document:
     """!
     @brief Parsed PDF file: object table, trailer and access to pages, labels and outline.
 
-    Objects are found by scanning the whole file for object headers, not by reading
-    the cross-reference table.
+    Objects are loaded through the cross-reference chain that starts at the last
+    startxref: classic tables, cross-reference streams (/W, /Index) and hybrid files
+    (/XRefStm), following /Prev. The newest revision wins, objects that it marks free
+    are not loaded, and a reference whose generation number differs from the loaded
+    object's resolves to None. When the chain cannot be read or an offset does not
+    point to the object it names, the whole file is scanned for object headers
+    instead; a later definition then wins.
 
     @par Attributes
     - data: the file bytes.
     - objects: object number to parsed object (dict, list, Stream, number, ...).
     - objpos: object number to byte offset of its definition; objects from an object
       stream get the offset of that stream.
+    - gens: object number to generation number, for objects whose generation is not 0.
     - _dec: cache of decoded stream bytes keyed by id() of the Stream.
+    - _dec_size: total bytes held in _dec, at most MAX_DOC_DECODED.
+    - _spans: (start, end) byte ranges of the objects found by the scan, in file order.
     - trailer: merged trailer dictionary.
     - encrypted: True when the trailer has an /Encrypt entry.
     """
@@ -742,8 +973,12 @@ class Document:
         """!
         @brief Parse a PDF file held in memory.
 
-        Scans objects, expands object streams, fixes stream lengths given as references
-        and builds the trailer.
+        Reads the cross-reference chain. When that fails, scans for objects, expands
+        object streams, fixes stream lengths given as references and builds the trailer
+        from the trailer dictionaries outside objects and comments. The scan is
+        recorded with problem() when no cross-reference section can be read or the
+        sections found disagree with the scanned objects. When /Root does not resolve
+        to a dictionary, the first /Type /Catalog object is used as root.
         @param data the whole file as bytes.
         @exception PDFError when no %PDF header is in the first 1024 bytes.
         """
@@ -756,14 +991,40 @@ class Document:
         ## object number to byte offset of its definition; objects from an object
         ## stream get the offset of that stream.
         self.objpos = {}
+        ## object number to generation number, for objects whose generation is not 0.
+        self.gens = {}
         ## cache of decoded stream bytes keyed by id() of the Stream.
         self._dec = {}
-        pending = self._scan()
-        self._fix_lengths(pending)
-        self._expand_object_streams()
-        self._fix_lengths(pending)
+        ## total bytes held in _dec, at most MAX_DOC_DECODED.
+        self._dec_size = 0
+        ## (start, end) byte ranges of the objects found by the scan, in file order.
+        self._spans = []
+        saved = dict(PROBLEMS)
+        try:
+            trailer = self._load_xref()
+        except Exception:  # any damage in the chain: recover by scanning
+            trailer = None
+        if trailer is None:
+            PROBLEMS.clear()
+            PROBLEMS.update(saved)
+            self.objects, self.objpos, self.gens = {}, {}, {}
+            self._dec, self._dec_size = {}, 0
+            pending = self._scan()
+            self._fix_lengths(pending)
+            self._expand_object_streams()
+            self._fix_lengths(pending)
+            trailer = self._trailer()
+            if not self._scan_agrees():
+                problem(
+                    'malformed', 'cross-reference table unreadable; objects recovered by scanning'
+                )
+        if not isinstance(self.resolve(trailer.get('Root')), dict):
+            for num, o in self.objects.items():
+                if isinstance(o, dict) and o.get('Type') == 'Catalog':
+                    trailer['Root'] = Ref(num, self.gens.get(num, 0))
+                    break
         ## merged trailer dictionary.
-        self.trailer = self._trailer()
+        self.trailer = trailer
         ## True when the trailer has an /Encrypt entry.
         self.encrypted = 'Encrypt' in self.trailer
 
@@ -777,16 +1038,223 @@ class Document:
         """
         return self.data[p : p + 32].lstrip().startswith(b'endstream')
 
+    def _read_object(self, pos):
+        """!
+        @brief Parse the object that follows an "num gen obj" header.
+
+        A stream uses /Length when that is a direct integer followed by endstream;
+        otherwise its data runs to the next endstream, without the end-of-line before it.
+        @param pos byte offset just after the obj keyword.
+        @return tuple (object, end offset, data start offset of a stream whose /Length is
+        an indirect reference, else None).
+        """
+        d = self.data
+        lx = Lexer(d, pos)
+        val = lx.value()
+        end = lx.p
+        if not isinstance(val, dict):
+            return val, end, None
+        t = lx.token()
+        if not (isinstance(t, Op) and t == 'stream'):
+            return val, end, None
+        start = lx.p
+        if d[start : start + 2] == b'\r\n':
+            start += 2
+        elif d[start : start + 1] in (b'\n', b'\r'):
+            start += 1
+        length = val.get('Length')
+        if type(length) is int and length >= 0 and self._valid_end(start + length):
+            return Stream(val, d[start : start + length]), start + length, None
+        e = d.find(b'endstream', start)
+        if e < 0:
+            e = len(d)
+        stop = e
+        if d[stop - 2 : stop] == b'\r\n':
+            stop -= 2
+        elif d[stop - 1 : stop] in (b'\n', b'\r'):
+            stop -= 1
+        pend = start if isinstance(length, Ref) else None
+        return Stream(val, d[start : max(start, stop)]), e + 9, pend
+
+    def _xref_stream_entries(self, s):
+        """!
+        @brief Read the entries of a /Type /XRef cross-reference stream.
+
+        Entries of a type other than 0, 1 and 2 are returned too; they stand for null.
+        At most min(/Size, file length in bytes, MAX_XREF_ENTRIES) entries are read (/Size
+        only when present), and object numbers at or above that bound are skipped.
+        @param s the cross-reference Stream.
+        @return list of (object number, (type, field 2, field 3)). Type 0 is free, type 1
+        is (1, offset, generation) and type 2 is (2, object stream number, index).
+        @exception PDFError when /W or /Index is invalid or the data does not decode.
+        """
+        w = s.get('W')
+        if not (isinstance(w, list) and len(w) == 3):
+            raise PDFError('invalid /W')
+        if not all(type(v) is int and 0 <= v <= 8 for v in w) or not (w[1] or w[2]):
+            raise PDFError('invalid /W')
+        index = s.get('Index', [0, s.get('Size')])
+        if not isinstance(index, list):
+            raise PDFError('invalid /Index')
+        data, native = self.decode(s)
+        if native:
+            raise PDFError('image filter on a cross-reference stream')
+        w0, w1, w2 = w
+        rl = w0 + w1 + w2
+        fb = int.from_bytes
+        size = s.get('Size')
+        bound = min(len(self.data), MAX_XREF_ENTRIES)
+        if type(size) is int and size >= 0:
+            bound = min(bound, size)
+        out = []
+        p = 0
+        for i in range(0, len(index) - 1, 2):
+            first, count = index[i], index[i + 1]
+            if type(first) is not int or type(count) is not int or first < 0:
+                raise PDFError('invalid /Index')
+            if len(out) >= bound or first >= bound:
+                break
+            count = min(count, (len(data) - p) // rl, bound - first, bound - len(out))
+            for k in range(count):
+                t = fb(data[p : p + w0], 'big') if w0 else 1
+                f2 = fb(data[p + w0 : p + w0 + w1], 'big')
+                f3 = fb(data[p + w0 + w1 : p + rl], 'big')
+                p += rl
+                out.append((first + k, (t, f2, f3)))
+        return out
+
+    def _xref_section(self, pos):
+        """!
+        @brief Read one cross-reference section: a classic table or a cross-reference stream.
+        @param pos byte offset of the xref keyword or of the stream's object header.
+        @return tuple (list of entries as from _xref_stream_entries, trailer dictionary).
+        For a stream, the trailer is the stream dictionary.
+        @exception PDFError when no valid section starts at pos.
+        """
+        d = self.data
+        lx = Lexer(d, pos)
+        t = lx.token()
+        if type(t) is int:
+            hm = _XOBJ_RE.match(d, pos)
+            if not hm:
+                raise PDFError('no object header at %d' % pos)
+            s = self._read_object(hm.end())[0]
+            if not isinstance(s, Stream) or s.get('Type') != 'XRef':
+                raise PDFError('object at %d is not a cross-reference stream' % pos)
+            s.num, s.gen = int(hm.group(1)), int(hm.group(2))
+            return self._xref_stream_entries(s), s.dict
+        if not (isinstance(t, Op) and t == 'xref'):
+            raise PDFError('no cross-reference section at %d' % pos)
+        out = []
+        p = lx.p
+        while True:
+            h = _XSUB_RE.match(d, p)
+            if not h:
+                break
+            first, count = int(h.group(1)), int(h.group(2))
+            p = h.end()
+            for k in range(count):
+                e = _XENT_RE.match(d, p)
+                if not e:
+                    break
+                p = e.end()
+                if e.group(3) == b'n':
+                    out.append((first + k, (1, int(e.group(1)), int(e.group(2)))))
+                else:
+                    out.append((first + k, (0, 0, int(e.group(2)))))
+        lx = Lexer(d, p)
+        t = lx.token()
+        trailer = lx.value() if isinstance(t, Op) and t == 'trailer' else None
+        if not isinstance(trailer, dict):
+            raise PDFError('no trailer after the cross-reference table at %d' % pos)
+        return out, trailer
+
+    def _load_xref(self):
+        """!
+        @brief Load the objects named by the cross-reference chain from the last startxref.
+
+        For each object number the newest entry wins: a section's table entries, then its
+        /XRefStm stream, then the /Prev sections. Within one section, an /XRefStm entry
+        replaces a free table entry, since hybrid files list objects that are stored in
+        object streams as free in the table. Type 1 entries are parsed at their
+        offset, type 2 entries are read from their object stream. Free and unknown entries
+        are not loaded.
+        @return the merged trailer dictionary, or None when there is no startxref or no
+        object was loaded.
+        @exception PDFError when a section is invalid or an offset does not point to the
+        header of the object it names.
+        """
+        d = self.data
+        k = d.rfind(b'startxref')
+        m = _STARTXREF_RE.match(d, k) if k >= 0 else None
+        if not m:
+            return None
+        entries = {}
+        trailers = []
+        pos, seen = int(m.group(1)), set()
+        while pos is not None and pos not in seen:
+            seen.add(pos)
+            sec, trailer = self._xref_section(pos)
+            own = dict(sec)
+            hybrid = trailer.get('XRefStm')
+            if type(hybrid) is int and 'W' not in trailer and hybrid not in seen:
+                seen.add(hybrid)
+                for num, ent in self._xref_section(hybrid)[0]:
+                    # a hybrid table lists objects in object streams as free
+                    if own.get(num, (0,))[0] == 0:
+                        own[num] = ent
+            for num, ent in own.items():
+                entries.setdefault(num, ent)
+            trailers.append(trailer)
+            prev = trailer.get('Prev')
+            pos = prev if type(prev) is int else None
+        merged = {}
+        for t in reversed(trailers):
+            merged.update(t)
+        pending = []
+        packed = {}
+        for num, (t, a, b) in entries.items():
+            if t == 1 and num:
+                hm = _XOBJ_RE.match(d, a)
+                if not hm or int(hm.group(1)) != num or int(hm.group(2)) != b:
+                    raise PDFError('object %d %d R is not at offset %d' % (num, b, a))
+                val, _, plen = self._read_object(hm.end())
+                if isinstance(val, Stream):
+                    val.num, val.gen = num, b
+                    if plen is not None:
+                        pending.append((val, plen))
+                self.objects[num] = val
+                self.objpos[num] = a
+                if b:
+                    self.gens[num] = b
+            elif t == 2:
+                packed.setdefault(a, []).append(num)
+        if not self.objects:
+            return None
+        self._fix_lengths(pending)
+        for snum, nums in packed.items():
+            s = self.objects.get(snum)
+            if not isinstance(s, Stream):
+                raise PDFError('object stream %d 0 R is missing' % snum)
+            data, first, pairs = self._objstm_entries(s)
+            offs = dict(pairs)
+            for onum in nums:
+                if onum in offs:
+                    self.objects[onum] = Lexer(data, first + offs[onum]).value()
+                    self.objpos[onum] = self.objpos[snum]
+        if packed:
+            self._fix_lengths(pending)  # /Length values stored in object streams
+        return merged
+
     def _scan(self):
         """!
         @brief Find every "num gen obj" header in the file and parse its object.
 
         A later definition of the same number replaces an earlier one. Matches inside a
-        parsed object or stream are skipped. A stream uses /Length when that is a direct
-        integer followed by endstream; otherwise its data runs to the next endstream,
-        without the end-of-line before it.
-        @return list of (object number, data start offset) for streams whose /Length is
-        an indirect reference.
+        parsed object or stream are skipped. The byte range of each object is kept in
+        _spans.
+        @return list of (Stream, data start offset) for streams whose /Length is an
+        indirect reference.
         """
         d = self.data
         pending = []
@@ -794,44 +1262,22 @@ class Document:
         for m in _OBJ_RE.finditer(d):
             if m.start() < skip:
                 continue
-            num = int(m.group(1))
-            lx = Lexer(d, m.end())
+            num, gen = int(m.group(1)), int(m.group(2))
             try:
-                val = lx.value()
-            except Exception:
+                val, end, plen = self._read_object(m.end())
+            except Exception:  # unparsable object: the scan goes on at the next header
                 continue
-            end = lx.p
-            if isinstance(val, dict):
-                save = lx.p
-                t = lx.token()
-                if isinstance(t, Op) and t == 'stream':
-                    start = lx.p
-                    if d[start : start + 2] == b'\r\n':
-                        start += 2
-                    elif d[start : start + 1] in (b'\n', b'\r'):
-                        start += 1
-                    length = val.get('Length')
-                    if type(length) is int and length >= 0 and self._valid_end(start + length):
-                        raw = d[start : start + length]
-                        end = start + length
-                    else:
-                        e = d.find(b'endstream', start)
-                        if e < 0:
-                            e = len(d)
-                        stop = e
-                        if d[stop - 2 : stop] == b'\r\n':
-                            stop -= 2
-                        elif d[stop - 1 : stop] in (b'\n', b'\r'):
-                            stop -= 1
-                        raw = d[start : max(start, stop)]
-                        end = e + 9
-                        if isinstance(length, Ref):
-                            pending.append((num, start))
-                    val = Stream(val, raw)
-                else:
-                    lx.p = save
+            if isinstance(val, Stream):
+                val.num, val.gen = num, gen
+                if plen is not None:
+                    pending.append((val, plen))
             self.objects[num] = val
             self.objpos[num] = m.start()
+            if gen:
+                self.gens[num] = gen
+            else:
+                self.gens.pop(num, None)
+            self._spans.append((m.start(), end))
             skip = end
         return pending
 
@@ -840,66 +1286,105 @@ class Document:
         @brief Re-cut stream data using indirect /Length values once they can be resolved.
 
         The new length is used only when endstream follows it.
-        @param pending list of (object number, data start offset) from _scan().
+        @param pending list of (Stream, data start offset) from _read_object().
         """
-        for num, start in pending:
-            s = self.objects.get(num)
-            if not isinstance(s, Stream):
-                continue
+        for s, start in pending:
             n = self.resolve(s.get('Length'))
             if type(n) is int and n >= 0 and self._valid_end(start + n):
                 s.raw = self.data[start : start + n]
+
+    def _objstm_entries(self, s):
+        """!
+        @brief Read the header of a /Type /ObjStm object stream.
+
+        At most /N pairs and at most one pair per 4 decoded bytes are read.
+        @param s the object Stream.
+        @return tuple (decoded data, /First offset, list of (object number, offset
+        relative to /First)).
+        @exception TypeError or ValueError when /N or /First is not a number.
+        """
+        data = self.decoded(s)
+        n = min(int(self.resolve(s.get('N'))), len(data) // 4)
+        first = int(self.resolve(s.get('First')))
+        lx = Lexer(data)
+        header = []
+        while len(header) < 2 * n and lx.p < first:
+            t = lx.token()
+            if t is None:
+                break
+            header.append(t)
+        pairs = []
+        for i in range(0, len(header) - 1, 2):
+            onum, off = header[i], header[i + 1]
+            if type(onum) is int and type(off) is int:
+                pairs.append((onum, off))
+        return data, first, pairs
 
     def _expand_object_streams(self):
         """!
         @brief Add the objects stored in /Type /ObjStm object streams to the object table.
 
-        An object already defined later in the file than the object stream is kept.
-        Object streams that fail to parse are skipped.
+        Used by the scan. An object already defined later in the file than the object
+        stream is kept. Object streams that fail to parse are recorded with problem().
         """
         for snum, s in list(self.objects.items()):
             if not isinstance(s, Stream) or s.get('Type') != 'ObjStm':
                 continue
             try:
-                data = self.decoded(s)
-                n = min(int(self.resolve(s.get('N'))), len(data) // 4)
-                first = int(self.resolve(s.get('First')))
-                lx = Lexer(data)
-                header = []
-                while len(header) < 2 * n and lx.p < first:
-                    t = lx.token()
-                    if t is None:
-                        break
-                    header.append(t)
-                for i in range(0, len(header) - 1, 2):
-                    onum, off = header[i], header[i + 1]
-                    if type(onum) is not int or type(off) is not int:
-                        continue
-                    spos = self.objpos.get(snum, 0)
+                data, first, pairs = self._objstm_entries(s)
+                spos = self.objpos.get(snum, 0)
+                for onum, off in pairs:
                     if onum in self.objects and self.objpos.get(onum, -1) > spos:
                         continue
                     self.objects[onum] = Lexer(data, first + off).value()
                     self.objpos[onum] = spos
-            except Exception:
-                continue
+                    self.gens.pop(onum, None)
+            except Exception as exc:  # damaged object stream: its objects stay missing
+                problem('malformed', 'object %s: %s' % (s.label(), _one_line(exc)))
+
+    def _outside_objects(self, pos):
+        """!
+        @brief Check that a position is outside every scanned object and comment.
+
+        Objects include their strings and stream data. A % earlier on the same line, at
+        most 4096 bytes back, marks a comment.
+        @param pos byte offset in the file.
+        @return True when pos is in neither.
+        """
+        spans = self._spans
+        lo, hi = 0, len(spans)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if spans[mid][0] <= pos:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo and pos < spans[lo - 1][1]:
+            return False
+        d = self.data
+        low = max(0, pos - 4096)
+        line = max(d.rfind(b'\n', low, pos), d.rfind(b'\r', low, pos), low - 1) + 1
+        return b'%' not in d[line:pos]
 
     def _trailer(self):
         """!
-        @brief Build the trailer dictionary.
+        @brief Build the trailer dictionary for the scan.
 
-        Merges all trailer dictionaries and cross-reference stream dictionaries in file
-        order, later entries overriding earlier ones. When /Root does not resolve to a
-        dictionary, the first /Type /Catalog object is used as root.
+        Merges all trailer dictionaries outside objects and comments, and all
+        cross-reference stream dictionaries, in file order, later entries overriding
+        earlier ones.
         @return the merged trailer dictionary.
         """
         found = []
         for m in _TRAILER_RE.finditer(self.data):
+            if not self._outside_objects(m.start()):
+                continue
             try:
                 t = Lexer(self.data, m.start() + 7).value()
-                if isinstance(t, dict):
-                    found.append((m.start(), t))
-            except Exception:
-                pass
+            except Exception:  # damaged trailer: the other trailers still count
+                continue
+            if isinstance(t, dict):
+                found.append((m.start(), t))
         for num, o in self.objects.items():
             if isinstance(o, Stream) and o.get('Type') == 'XRef':
                 found.append((self.objpos.get(num, 0), o.dict))
@@ -907,24 +1392,66 @@ class Document:
         merged = {}
         for _, t in found:
             merged.update(t)
-        if not isinstance(self.resolve(merged.get('Root')), dict):
-            for num, o in self.objects.items():
-                if isinstance(o, dict) and o.get('Type') == 'Catalog':
-                    merged['Root'] = Ref(num, 0)
-                    break
         return merged
+
+    def _scan_agrees(self):
+        """!
+        @brief Check the scanned objects against the cross-reference sections in the file.
+
+        Sections are found by the xref keyword outside objects and comments, and as
+        /Type /XRef streams; their offsets are not used, so offsets shifted by edits do
+        not matter. Later sections override earlier ones.
+        @return True when at least one section is readable and no object it marks free
+        was found, every in-use object was found and the generation numbers match.
+        """
+        sections = []
+        for m in _XREF_RE.finditer(self.data):
+            if self._outside_objects(m.start()):
+                try:
+                    sections.append((m.start(), self._xref_section(m.start())[0]))
+                except Exception:  # unreadable section: it does not count
+                    continue
+        for num, o in self.objects.items():
+            if isinstance(o, Stream) and o.get('Type') == 'XRef':
+                try:
+                    sections.append((self.objpos.get(num, 0), self._xref_stream_entries(o)))
+                except Exception:  # unreadable section: it does not count
+                    continue
+        if not sections:
+            return False
+        sections.sort(key=lambda x: x[0])
+        latest = {}
+        for _, sec in sections:
+            for num, ent in sec:
+                # a hybrid table lists objects in object streams as free
+                if ent[0] != 0 or latest.get(num, (0,))[0] != 2:
+                    latest[num] = ent
+        for num, (t, _, b) in latest.items():
+            if num == 0:
+                continue
+            if t == 0 and num in self.objects:
+                return False
+            if t == 1 and (num not in self.objects or self.gens.get(num, 0) != b):
+                return False
+            if t == 2 and num not in self.objects:
+                return False
+        return True
 
     def resolve(self, x):
         """!
         @brief Follow indirect references to the object they name.
         @param x any object, possibly a Ref.
         @return the referenced object, x itself when it is not a Ref, or None for a missing
-        object or a chain longer than 32 references.
+        object, a generation number that differs from the loaded object's, or a chain
+        longer than 32 references.
         """
+        objects, gens = self.objects, self.gens
         for _ in range(32):
             if not isinstance(x, Ref):
                 return x
-            x = self.objects.get(x.num)
+            if x.gen != gens.get(x.num, 0):
+                return None
+            x = objects.get(x.num)
         return None
 
     def decode(self, s):
@@ -933,7 +1460,9 @@ class Document:
 
         Supports FlateDecode and LZWDecode (with predictors), ASCII85Decode,
         ASCIIHexDecode and RunLengthDecode, also by their abbreviated names.
-        At the first image filter (IMAGE_FILTERS) decoding stops.
+        At the first image filter (IMAGE_FILTERS) decoding stops. After every filter
+        stage the data is cut to MAX_DECODED bytes; reaching that size is recorded with
+        problem().
         @param s the Stream.
         @return tuple (bytes, native image filter name or None). With an image filter the
         bytes are the data still in that filter's encoding.
@@ -948,6 +1477,7 @@ class Document:
             filters = [filters]
         if not isinstance(parms, list):
             parms = [parms]
+        cut = False
         for i, f in enumerate(filters):
             f = self.resolve(f)
             p = self.resolve(parms[i]) if i < len(parms) else None
@@ -965,23 +1495,50 @@ class Document:
                 return data, f
             else:
                 raise PDFError('unsupported filter %s' % f)
+            if len(data) >= MAX_DECODED and not cut:
+                cut = True
+                problem(
+                    'limit',
+                    '%s: decoded size reached MAX_DECODED (%s)'
+                    % (s.label(), _size_text(MAX_DECODED)),
+                )
+            if len(data) > MAX_DECODED:
+                data = data[:MAX_DECODED]
         return data, None
 
     def decoded(self, s):
         """!
         @brief Return the decoded bytes of a stream, cached per stream.
+
+        Decoding errors are recorded with problem(): an unsupported filter as
+        'unsupported', damaged data as 'malformed', anything else as 'internal'. Once
+        the cache holds MAX_DOC_DECODED bytes, further streams are decoded on every call
+        instead of being cached.
         @param s the Stream.
         @return the decoded bytes, or b'' when decoding fails or the stream ends in an image
         filter.
         """
         key = id(s)
-        if key not in self._dec:
-            try:
-                data, native = self.decode(s)
-                self._dec[key] = b'' if native else data
-            except Exception:
-                self._dec[key] = b''
-        return self._dec[key]
+        data = self._dec.get(key)
+        if data is not None:
+            return data
+        try:
+            data, native = self.decode(s)
+            if native:
+                data = b''
+        except PDFError as exc:
+            problem('unsupported', '%s: %s' % (s.label(), _one_line(exc)))
+            data = b''
+        except (ValueError, zlib.error) as exc:
+            problem('malformed', '%s: %s' % (s.label(), _one_line(exc)))
+            data = b''
+        except Exception as exc:  # a decoder bug must not end the conversion
+            problem('internal', '%s: %s: %s' % (s.label(), type(exc).__name__, _one_line(exc)))
+            data = b''
+        if self._dec_size + len(data) <= MAX_DOC_DECODED:
+            self._dec[key] = data
+            self._dec_size += len(data)
+        return data
 
     def pages(self):
         """!
@@ -1870,6 +2427,62 @@ def _clean(t):
     return ''.join(out)
 
 
+## @brief Code space ranges, as (byte count, low code, high code), of a predefined
+## CMap whose codes are all two bytes long.
+_CS_TWO = [(2, 0, 0xFFFF)]
+## @brief Code space ranges of the predefined Shift-JIS (RKSJ) CMaps.
+_CS_RKSJ = [(1, 0, 0x80), (1, 0xA0, 0xDF), (2, 0x8140, 0x9FFC), (2, 0xE040, 0xFCFC)]
+## @brief Code space ranges of the predefined EUC CMaps (EUC-H, GB-EUC, KSC-EUC, ...).
+_CS_EUC = [(1, 0, 0x80), (2, 0x8EA0, 0x8EDF), (2, 0xA1A1, 0xFEFE)]
+## @brief Code space ranges of the predefined GBK, Big Five and UHC CMaps.
+_CS_LEAD81 = [(1, 0, 0x80), (2, 0x8140, 0xFEFE)]
+## @brief Code space ranges of the predefined GBK2K CMaps (one, two and four bytes).
+_CS_GBK2K = [(1, 0, 0x80), (2, 0x8140, 0xFEFE), (4, 0x81308130, 0xFE39FE39)]
+
+
+def _predefined_codespace(name):
+    """!
+    @brief Return the code space ranges of a predefined CMap name.
+
+    Two bytes: Identity, the ISO-2022 CMaps (H, V, 78, Ext, Add, NWP, KSC, GB, GBT,
+    CNS1, CNS2) and the Unicode UCS2 and UTF16 CMaps. Four bytes: the UTF32 CMaps.
+    One byte: Hankaku, Hiragana, Katakana, Roman and WP-Symbol. Mixed widths: RKSJ
+    (Shift-JIS), GBK2K, GBK, Big Five (B5), UHC and Johab CMaps (Johab with the UHC
+    ranges as an approximation), then the other EUC CMaps.
+    @param name CMap name, e.g. '90ms-RKSJ-H'
+    @return list of (byte count, low code, high code), or None for an unknown name
+    """
+    base = re.sub(r'-[HV]$', '', name)
+    if re.search(r'UCS2|UTF16', name) or base in (
+        'Identity',
+        'H',
+        'V',
+        '78',
+        'Ext',
+        'Add',
+        'NWP',
+        'KSC',
+        'GB',
+        'GBT',
+        'CNS1',
+        'CNS2',
+    ):
+        return _CS_TWO
+    if 'UTF32' in name:
+        return [(4, 0, 0x10FFFF)]
+    if base in ('Hankaku', 'Hiragana', 'Katakana', 'Roman', 'WP-Symbol'):
+        return [(1, 0, 0xFF)]
+    if 'RKSJ' in name:
+        return _CS_RKSJ
+    if 'GBK2K' in name:
+        return _CS_GBK2K
+    if re.search(r'GBK|B5|UHC|Johab', name):
+        return _CS_LEAD81
+    if 'EUC' in name:
+        return _CS_EUC
+    return None
+
+
 class Font:
     """!
     @brief Text decoding and glyph widths of one PDF font dictionary.
@@ -1897,7 +2510,10 @@ class Font:
     - symbol: symbol table kind from the base font name ('symbol', 'zapf',
       'wingdings') or None
     - two_byte: True when every code is 2 bytes (composite fonts only)
+    - name: BaseFont name used in problem reports
     - _cache: code -> decoded text cache
+    - _text_total: characters stored into tounicode so far, compared with MAX_FONT_TEXT
+    - _limited: names of the limits already reported for this font
     """
 
     def __init__(self, doc, fd):
@@ -1909,9 +2525,12 @@ class Font:
         oblique) or flag value 64. Monospace from the name (courier, mono, consol, menlo,
         typewriter, cmtt) or flag value 1. Serif from the name, unless it contains "sans".
         Default width: 600 for monospace, 500 otherwise, in 1/1000 em.
-        A ToUnicode stream is parsed first; parse errors are ignored.
-        Type0 fonts: an embedded encoding CMap fills codespace and cidmap; a predefined
-        UCS2 or UTF16 CMap name sets unicode_codes. Without any text mapping, the cmap
+        A ToUnicode stream is parsed first; a parse error is recorded as 'malformed'.
+        Type0 fonts: an embedded encoding CMap fills codespace and cidmap. A predefined
+        CMap name sets the code space of its family (see _predefined_codespace); UCS2,
+        UTF16 and UTF32 names also set unicode_codes. An unknown name keeps the code
+        space of the ToUnicode CMap, or, without one, reads two-byte codes and records
+        an 'unsupported' problem. Without any text mapping, the cmap
         table of an embedded TrueType program (FontFile2) of the descendant font is
         used, through the CIDToGIDMap stream when present. Widths come from DW (default
         1000) and the W array; a range in W covers at most 65536 codes.
@@ -1979,12 +2598,18 @@ class Font:
         self.symbol = _symbol_kind(base)
         ## code -> decoded text cache
         self._cache = {}
+        ## BaseFont name used in problem reports
+        self.name = base or '(unnamed)'
+        ## characters stored into tounicode so far, compared with MAX_FONT_TEXT
+        self._text_total = 0
+        ## names of the limits already reported for this font
+        self._limited = set()
         tu = r(fd.get('ToUnicode'))
         if isinstance(tu, Stream):
             try:
                 self._parse_cmap(doc.decoded(tu))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._bad('ToUnicode CMap', exc)
         if isinstance(desc, dict):
             ff = r(desc.get('FontFile')) or r(desc.get('FontFile2'))
         else:
@@ -1999,13 +2624,20 @@ class Font:
                 self.codespace = []
                 try:
                     self._parse_cmap(doc.decoded(enc), encoding=True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._bad('encoding CMap', exc)
             elif isinstance(enc, str):
-                # predefined CMap (Identity-H/V, UCS-2, UTF-16): 2-byte codes; a code space
-                # declared in the ToUnicode CMap does not apply
-                self.codespace = []
-                self.unicode_codes = bool(re.search(r'UCS2|UTF16', enc))
+                # predefined CMap: its own code space replaces the one declared in the
+                # ToUnicode CMap; an unknown name keeps the ToUnicode code space
+                cs = _predefined_codespace(enc)
+                if cs is not None:
+                    self.codespace = list(cs)
+                elif not self.codespace:
+                    problem(
+                        'unsupported',
+                        'font %s: encoding %s parsed as two-byte codes' % (self.name, enc),
+                    )
+                self.unicode_codes = bool(re.search(r'UCS2|UTF16|UTF32', enc))
             if not self.tounicode and not self.unicode_codes:
                 # no text mapping: try the cmap table of an embedded TrueType program
                 ddesc = r(dsc.get('FontDescriptor'))
@@ -2016,14 +2648,18 @@ class Font:
                         c2g = r(dsc.get('CIDToGIDMap'))
                         c2g = doc.decoded(c2g) if isinstance(c2g, Stream) else None
                         if c2g:
-                            for cid in range(len(c2g) // 2):
+                            n = len(c2g) // 2
+                            if n > MAX_FONT_ENTRIES:
+                                n = MAX_FONT_ENTRIES
+                                self._limit('MAX_FONT_ENTRIES (CIDToGIDMap)')
+                            for cid in range(n):
                                 gid = (c2g[2 * cid] << 8) | c2g[2 * cid + 1]
                                 if gid in gids:
                                     self.cid_text[cid] = gids[gid]
                         else:  # /Identity: CID = glyph id
                             self.cid_text = gids
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._bad('TrueType cmap', exc)
             dw = r(dsc.get('DW'))
             self.default_width = float(dw) if isinstance(dw, (int, float)) else 1000.0
             w = r(dsc.get('W'))
@@ -2051,6 +2687,8 @@ class Font:
                     i += 3
                 else:
                     break
+            if len(self.widths) >= MAX_FONT_ENTRIES and i < len(w):
+                self._limit('MAX_FONT_ENTRIES (W)')
             ## True when every code is 2 bytes (composite fonts only)
             self.two_byte = not self.codespace or all(n == 2 for n, _, _ in self.codespace)
         else:
@@ -2067,7 +2705,12 @@ class Font:
                         self.fmat = [v / det for v in fm] + [0.0, 0.0]
             fc = r(fd.get('FirstChar'))
             fc = fc if isinstance(fc, int) else 0
-            for i, x in enumerate(r(fd.get('Widths')) or []):
+            ws = r(fd.get('Widths'))
+            ws = ws if isinstance(ws, list) else []
+            if len(ws) > MAX_FONT_ENTRIES:
+                ws = ws[:MAX_FONT_ENTRIES]
+                self._limit('MAX_FONT_ENTRIES (Widths)')
+            for i, x in enumerate(ws):
                 x = r(x)
                 if isinstance(x, (int, float)):
                     self.widths[fc + i] = float(x) * scale
@@ -2096,7 +2739,8 @@ class Font:
                     ):
                         try:
                             builtin = _type1_encoding(doc.decoded(ff))
-                        except Exception:
+                        except Exception as exc:
+                            self._bad('Type 1 font program', exc)
                             builtin = None
                     if builtin is None:
                         basename = 'StandardEncoding'
@@ -2114,8 +2758,50 @@ class Font:
                     elif isinstance(x, Name):
                         ch = glyph_char(str(x))
                         if ch is not None:
-                            self.encoding[code] = ch
+                            if len(self.encoding) < MAX_FONT_ENTRIES or code in self.encoding:
+                                self.encoding[code] = ch
+                            else:
+                                self._limit('MAX_FONT_ENTRIES (Differences)')
                         code += 1
+
+    def _bad(self, what, exc):
+        """!
+        @brief Record a font part that could not be read as a 'malformed' problem.
+        @param what name of the part, e.g. 'ToUnicode CMap'
+        @param exc the exception raised while reading it
+        """
+        problem(
+            'malformed', 'font %s: %s not readable (%s)' % (self.name, what, type(exc).__name__)
+        )
+
+    def _limit(self, which):
+        """!
+        @brief Record once per font that a limit cut the font data.
+        @param which name of the limit, e.g. 'MAX_FONT_TEXT'
+        """
+        if which not in self._limited:
+            self._limited.add(which)
+            problem('limit', 'font %s: %s limit reached' % (self.name, which))
+
+    def _put_text(self, code, u):
+        """!
+        @brief Store the text of one code in tounicode within the font limits.
+
+        Fails when tounicode holds MAX_FONT_ENTRIES codes and code is new, or when
+        MAX_FONT_TEXT characters have been stored; the limit is then reported once.
+        @param code character code
+        @param u text, at most MAX_CMAP_DEST characters
+        @return True when stored, False when a limit was reached
+        """
+        if len(self.tounicode) >= MAX_FONT_ENTRIES and code not in self.tounicode:
+            self._limit('MAX_FONT_ENTRIES (ToUnicode)')
+            return False
+        if self._text_total + len(u) > MAX_FONT_TEXT:
+            self._limit('MAX_FONT_TEXT')
+            return False
+        self._text_total += len(u)
+        self.tounicode[code] = u
+        return True
 
     def _parse_cmap(self, data, encoding=False):
         """!
@@ -2127,6 +2813,9 @@ class Font:
         As an encoding CMap (encoding=True): codespace ranges fill codespace, cidrange
         and cidchar entries fill cidmap.
         Ranges wider than 65536 codes are skipped (bfrange) or truncated (cidrange).
+        Destinations are cut to MAX_CMAP_DEST characters. tounicode and cidmap stop
+        growing at MAX_FONT_ENTRIES codes, and tounicode at MAX_FONT_TEXT characters
+        stored; each cut is reported once per font as a 'limit' problem.
         @param data decoded CMap stream bytes
         @param encoding True to read an embedded encoding CMap instead of a ToUnicode CMap
         """
@@ -2152,20 +2841,26 @@ class Font:
                         if isinstance(lo, bytes) and isinstance(hi, bytes) and isinstance(cid, int):
                             lo, hi = int.from_bytes(lo, 'big'), int.from_bytes(hi, 'big')
                             room = MAX_FONT_ENTRIES - len(self.cidmap)
+                            if hi - lo >= room:
+                                self._limit('MAX_FONT_ENTRIES (cidrange)')
                             for k in range(min(hi - lo, 65535, room - 1) + 1):
                                 self.cidmap[lo + k] = cid + k
                 elif encoding and kw == 'endcidchar':
                     for i in range(0, len(ops) - 1, 2):
                         src, cid = ops[i], ops[i + 1]
                         if isinstance(src, bytes) and isinstance(cid, int):
-                            self.cidmap[int.from_bytes(src, 'big')] = cid
+                            src = int.from_bytes(src, 'big')
+                            if len(self.cidmap) < MAX_FONT_ENTRIES or src in self.cidmap:
+                                self.cidmap[src] = cid
+                            else:
+                                self._limit('MAX_FONT_ENTRIES (cidchar)')
                 elif kw == 'endbfchar':
                     for i in range(0, len(ops) - 1, 2):
                         src, dst = ops[i], ops[i + 1]
                         if isinstance(src, bytes):
                             u = self._u(dst)
-                            if u is not None:
-                                self.tounicode[int.from_bytes(src, 'big')] = u
+                            if u is not None and not self._put_text(int.from_bytes(src, 'big'), u):
+                                break
                 elif kw == 'endbfrange':
                     for i in range(0, len(ops) - 2, 3):
                         lo, hi, dst = ops[i], ops[i + 1], ops[i + 2]
@@ -2174,19 +2869,18 @@ class Font:
                         lo, hi = int.from_bytes(lo, 'big'), int.from_bytes(hi, 'big')
                         if hi < lo or hi - lo > 65535:
                             continue
-                        hi = min(hi, lo + MAX_FONT_ENTRIES - len(self.tounicode) - 1)
                         if isinstance(dst, list):
                             for j, x in enumerate(dst[: hi - lo + 1]):
                                 u = self._u(x)
-                                if u is not None:
-                                    self.tounicode[lo + j] = u
+                                if u is not None and not self._put_text(lo + j, u):
+                                    break
                         elif isinstance(dst, bytes):
                             u = self._u(dst)
                             if u:
                                 last = ord(u[-1])
-                                for k in range(hi - lo + 1):
-                                    if last + k <= 0x10FFFF:
-                                        self.tounicode[lo + k] = u[:-1] + chr(last + k)
+                                for k in range(min(hi - lo, 0x10FFFF - last) + 1):
+                                    if not self._put_text(lo + k, u[:-1] + chr(last + k)):
+                                        break
                 ops = []
             else:
                 ops.append(lx.build(t))
@@ -2197,7 +2891,7 @@ class Font:
         @brief Decode a CMap destination string to text.
 
         A 1-byte string maps to the character with that code. Longer strings decode as
-        UTF-16BE, with U+FFFD for invalid data.
+        UTF-16BE, with U+FFFD for invalid data, and are cut to MAX_CMAP_DEST characters.
         @param dst destination value from the CMap
         @return decoded string, or None when dst is not bytes
         """
@@ -2205,7 +2899,7 @@ class Font:
             return None
         if len(dst) == 1:
             return chr(dst[0])
-        return dst.decode('utf-16-be', errors='replace')
+        return dst[: 4 * MAX_CMAP_DEST].decode('utf-16-be', errors='replace')[:MAX_CMAP_DEST]
 
     def codes(self, s):
         """!
@@ -2216,16 +2910,40 @@ class Font:
         padded with a zero low byte.
         Other composite fonts: the shortest prefix of 1 to 4 bytes that lies in a
         codespace range; when none matches, one byte.
+        Codes are produced one at a time. After MAX_SHOW_CODES codes the rest of the
+        string is dropped and a 'limit' problem is recorded.
         @param s string operand bytes
-        @return list of (code, byte count) tuples
+        @return iterator of (code, byte count) tuples
         """
         if not self.cid:
-            return [(b, 1) for b in s]
-        if self.two_byte:
-            return [
+            it = ((b, 1) for b in s)
+        elif self.two_byte:
+            it = (
                 ((s[i] << 8) | (s[i + 1] if i + 1 < len(s) else 0), 2) for i in range(0, len(s), 2)
-            ]
-        out = []
+            )
+        else:
+            it = self._var_codes(s)
+        k = 0
+        for item in it:
+            if k >= MAX_SHOW_CODES:
+                problem(
+                    'limit',
+                    'font %s: string of %d bytes cut at MAX_SHOW_CODES (%d codes)'
+                    % (self.name, len(s), MAX_SHOW_CODES),
+                )
+                return
+            k += 1
+            yield item
+
+    def _var_codes(self, s):
+        """!
+        @brief Split a string into variable-width codes using the code space ranges.
+
+        Each code is the shortest prefix of 1 to 4 bytes that lies in a codespace
+        range; when none matches, one byte.
+        @param s string operand bytes
+        @return iterator of (code, byte count) tuples
+        """
         i = 0
         while i < len(s):
             for n in (1, 2, 3, 4):
@@ -2235,9 +2953,8 @@ class Font:
             else:
                 n = 1
                 c = s[i]
-            out.append((c, n))
+            yield c, n
             i += n
-        return out
 
     def text(self, code):
         """!
@@ -2667,6 +3384,10 @@ class PageContent:
         self.form_runs = 0
         ## content stream operators executed so far on this page (limit MAX_PAGE_OPS)
         self.op_count = 0
+        ## character codes shown so far on this page (limit MAX_PAGE_CODES)
+        self.code_count = 0
+        ## inline images (BI/ID/EI) placed at 1 point or more while shapes are collected
+        self.inline_images = 0
         ## True while annotation appearances run; then only text is collected
         self.no_shapes = False
 
@@ -2704,10 +3425,23 @@ class PageContent:
         if key not in self.fonts:
             try:
                 font = Font(self.doc, fd)
-            except Exception:  # malformed font dictionary
+            except Exception as exc:  # malformed font dictionary
+                base = self.doc.resolve(fd.get('BaseFont')) if isinstance(fd, dict) else None
+                what = '/' + base if isinstance(base, str) else 'dictionary'
+                problem('internal', 'font %s: %s' % (what[:64], self._exc_text(exc)))
                 font = Font(self.doc, None)
             self.fonts[key] = (font, fd)  # keep fd alive so id() stays unique
         return self.fonts[key][0]
+
+    @staticmethod
+    def _exc_text(exc):
+        """!
+        @brief Describe an exception in one short line for problem().
+        @param exc exception object
+        @return 'ExcType: message' with the message cut to 80 characters on one line
+        """
+        msg = ' '.join(str(exc).split())
+        return '%s: %s' % (type(exc).__name__, msg[:77] + '...' if len(msg) > 80 else msg)
 
     def _font(self, res, name):
         """!
@@ -2730,7 +3464,8 @@ class PageContent:
         path painting (PAINT operators and n), text state and positioning, text showing
         (Tj, TJ, ', "), Do and inline images (skipped). Color space operators cs and CS
         reset the colour to black. Other operators are ignored.
-        An operator that raises an exception is skipped.
+        An operator that raises an exception is skipped and recorded with problem().
+        Reaching MAX_PAGE_OPS stops the page and is recorded as a limit.
         @param data decoded content stream bytes
         @param res resource dictionary or a reference to it
         @param gs initial graphics state; modified in place until the first Q restore
@@ -2755,7 +3490,9 @@ class PageContent:
                 continue
             self.op_count += 1
             if self.op_count > MAX_PAGE_OPS:
-                break  # page budget used up: the rest of the page is not drawn
+                # page budget used up: the rest of the page is not drawn
+                problem('limit', 'page reached MAX_PAGE_OPS (%d operators)' % MAX_PAGE_OPS)
+                break
             op = str(t)
             try:
                 if op == 'q':
@@ -2884,8 +3621,14 @@ class PageContent:
                     self._do(res, ops[-1], gs, depth)
                 elif op == 'BI':
                     self._skip_inline_image(lx)
-            except Exception:
-                pass
+                    m = gs.ctm
+                    if (
+                        not self.no_shapes
+                        and min(math.hypot(m[0], m[1]), math.hypot(m[2], m[3])) >= 1
+                    ):
+                        self.inline_images += 1
+            except Exception as exc:
+                problem('internal', 'content operator %s: %s' % (op[:16], self._exc_text(exc)))
             ops = []
 
     def _paint(self, path, gs, op):
@@ -2934,8 +3677,9 @@ class PageContent:
         @brief Execute the Do operator for an XObject.
 
         Form XObjects run with their Matrix applied to a copy of the state and their own
-        resources (or the current ones). Forms nested deeper than 12 levels, or already
-        being run, are skipped.
+        resources (or the current ones). Forms nested deeper than 12 levels, forms past
+        MAX_FORM_RUNS, forms already being run, missing XObjects and forms whose content
+        raises an exception are skipped and recorded with problem().
         Image XObjects become an 'image' Shape covering the unit square mapped by the
         CTM, unless no_shapes is set or the image is under 1 point in both width and
         height.
@@ -2946,25 +3690,37 @@ class PageContent:
         """
         r = self.doc.resolve
         xobjs = r(res.get('XObject'))
-        xo = r(xobjs.get(name)) if isinstance(xobjs, dict) else None
+        ref = xobjs.get(name) if isinstance(xobjs, dict) else None
+        what = '%d %d R' % (ref.num, ref.gen) if isinstance(ref, Ref) else '/' + str(name)[:64]
+        xo = r(ref)
         if not isinstance(xo, Stream):
+            problem('malformed', 'XObject %s: missing or not a stream' % what)
             return
         st = r(xo.get('Subtype'))
         if st == 'Form':
-            if depth > 12 or id(xo) in self._active or self.form_runs >= MAX_FORM_RUNS:
+            if id(xo) in self._active:
+                problem('malformed', 'form %s: draws itself' % what)
+                return
+            if depth > 12:
+                problem('limit', 'form %s: nested deeper than 12 levels' % what)
+                return
+            if self.form_runs >= MAX_FORM_RUNS:
+                problem('limit', 'page reached MAX_FORM_RUNS (%d form runs)' % MAX_FORM_RUNS)
                 return
             self.form_runs += 1
-            mat = r(xo.get('Matrix'))
-            mat = (
-                [float(r(v)) for v in mat]
-                if isinstance(mat, list) and len(mat) == 6
-                else [1, 0, 0, 1, 0, 0]
-            )
-            g = gs.copy()
-            g.ctm = mmul(mat, gs.ctm)
             self._active.add(id(xo))
             try:
+                mat = r(xo.get('Matrix'))
+                mat = (
+                    [float(r(v)) for v in mat]
+                    if isinstance(mat, list) and len(mat) == 6
+                    else [1, 0, 0, 1, 0, 0]
+                )
+                g = gs.copy()
+                g.ctm = mmul(mat, gs.ctm)
                 self.run(self.doc.decoded(xo), xo.get('Resources') or res, g, depth + 1)
+            except Exception as exc:
+                problem('internal', 'form %s: %s' % (what, self._exc_text(exc)))
             finally:
                 self._active.discard(id(xo))
         elif st == 'Image' and not self.no_shapes:
@@ -3002,11 +3758,8 @@ class PageContent:
         @brief Collect the text of visible annotation appearance streams.
 
         Covers form field values, free text and stamps. Their borders and backgrounds
-        are skipped because no_shapes is set while they run.
-        Skips Link, Popup, Text, FileAttachment and Sound annotations, and annotations
-        with the Hidden (2) or NoView (32) flag.
-        The normal appearance (AP N, selected by AS when it is a dictionary) is mapped
-        from its BBox and Matrix onto the annotation Rect.
+        are skipped because no_shapes is set while they run. An annotation that fails
+        is skipped and recorded with problem(); the other annotations still run.
         @param page page dictionary
         @param ctm page transformation matrix applied after the Rect mapping
         """
@@ -3016,56 +3769,74 @@ class PageContent:
             return
         self.no_shapes = True
         try:
-            for a in annots:
-                a = r(a)
-                if not isinstance(a, dict) or r(a.get('Subtype')) in (
-                    'Link',
-                    'Popup',
-                    'Text',
-                    'FileAttachment',
-                    'Sound',
-                ):
-                    continue
-                flags = r(a.get('F'))
-                if isinstance(flags, int) and flags & (2 | 32):  # Hidden, NoView
-                    continue
-                ap = r(a.get('AP'))
-                xo = r(ap.get('N')) if isinstance(ap, dict) else None
-                if isinstance(xo, dict):
-                    state = r(a.get('AS'))
-                    xo = r(xo.get(state)) if isinstance(state, str) else None
-                rect = r(a.get('Rect'))
-                if not isinstance(xo, Stream) or not isinstance(rect, list) or len(rect) != 4:
-                    continue
+            for k, a in enumerate(annots):
+                what = '%d %d R' % (a.num, a.gen) if isinstance(a, Ref) else '#%d' % (k + 1)
                 try:
-                    rx = [float(r(v)) for v in rect]
-                    bb = r(xo.get('BBox'))
-                    bb = (
-                        [float(r(v)) for v in bb]
-                        if isinstance(bb, list) and len(bb) == 4
-                        else [0, 0, 1, 1]
-                    )
-                    mat = r(xo.get('Matrix'))
-                    mat = (
-                        [float(r(v)) for v in mat]
-                        if isinstance(mat, list) and len(mat) == 6
-                        else [1, 0, 0, 1, 0, 0]
-                    )
-                except (TypeError, ValueError):
-                    continue
-                pts = [apply(mat, x, y) for x in (bb[0], bb[2]) for y in (bb[1], bb[3])]
-                tx0, ty0 = min(p[0] for p in pts), min(p[1] for p in pts)
-                tx1, ty1 = max(p[0] for p in pts), max(p[1] for p in pts)
-                if tx1 - tx0 <= 0 or ty1 - ty0 <= 0:
-                    continue
-                sx = (max(rx[0], rx[2]) - min(rx[0], rx[2])) / (tx1 - tx0)
-                sy = (max(rx[1], rx[3]) - min(rx[1], rx[3])) / (ty1 - ty0)
-                fit = [sx, 0, 0, sy, min(rx[0], rx[2]) - sx * tx0, min(rx[1], rx[3]) - sy * ty0]
-                g = GState()
-                g.ctm = mmul(mmul(mat, fit), ctm)
-                self.run(self.doc.decoded(xo), xo.get('Resources') or {}, g, 1)
+                    self._annotation(r(a), ctm, what)
+                except Exception as exc:
+                    problem('internal', 'annotation %s: %s' % (what, self._exc_text(exc)))
         finally:
             self.no_shapes = False
+
+    def _annotation(self, a, ctm, what):
+        """!
+        @brief Run the appearance stream of one annotation.
+
+        Skips Link, Popup, Text, FileAttachment and Sound annotations, and annotations
+        with the Hidden (2) or NoView (32) flag.
+        The normal appearance (AP N, selected by AS when it is a dictionary) is mapped
+        from its BBox and Matrix onto the annotation Rect. A Rect, BBox or Matrix with
+        non-numeric entries is recorded as malformed and the annotation is skipped.
+        @param a resolved annotation dictionary
+        @param ctm page transformation matrix applied after the Rect mapping
+        @param what annotation name for problem() texts, e.g. '12 0 R'
+        """
+        r = self.doc.resolve
+        if not isinstance(a, dict) or r(a.get('Subtype')) in (
+            'Link',
+            'Popup',
+            'Text',
+            'FileAttachment',
+            'Sound',
+        ):
+            return
+        flags = r(a.get('F'))
+        if isinstance(flags, int) and flags & (2 | 32):  # Hidden, NoView
+            return
+        ap = r(a.get('AP'))
+        xo = r(ap.get('N')) if isinstance(ap, dict) else None
+        if isinstance(xo, dict):
+            state = r(a.get('AS'))
+            xo = r(xo.get(state)) if isinstance(state, str) else None
+        rect = r(a.get('Rect'))
+        if not isinstance(xo, Stream) or not isinstance(rect, list) or len(rect) != 4:
+            return
+        try:
+            rx = [float(r(v)) for v in rect]
+            bb = r(xo.get('BBox'))
+            bb = (
+                [float(r(v)) for v in bb] if isinstance(bb, list) and len(bb) == 4 else [0, 0, 1, 1]
+            )
+            mat = r(xo.get('Matrix'))
+            mat = (
+                [float(r(v)) for v in mat]
+                if isinstance(mat, list) and len(mat) == 6
+                else [1, 0, 0, 1, 0, 0]
+            )
+        except (TypeError, ValueError):
+            problem('malformed', 'annotation %s: Rect, BBox or Matrix is not numeric' % what)
+            return
+        pts = [apply(mat, x, y) for x in (bb[0], bb[2]) for y in (bb[1], bb[3])]
+        tx0, ty0 = min(p[0] for p in pts), min(p[1] for p in pts)
+        tx1, ty1 = max(p[0] for p in pts), max(p[1] for p in pts)
+        if tx1 - tx0 <= 0 or ty1 - ty0 <= 0:
+            return
+        sx = (max(rx[0], rx[2]) - min(rx[0], rx[2])) / (tx1 - tx0)
+        sy = (max(rx[1], rx[3]) - min(rx[1], rx[3])) / (ty1 - ty0)
+        fit = [sx, 0, 0, sy, min(rx[0], rx[2]) - sx * tx0, min(rx[1], rx[3]) - sy * ty0]
+        g = GState()
+        g.ctm = mmul(mmul(mat, fit), ctm)
+        self.run(self.doc.decoded(xo), xo.get('Resources') or {}, g, 1)
 
     @staticmethod
     def _skip_inline_image(lx):
@@ -3093,6 +3864,10 @@ class PageContent:
         applies only to the single-byte code 32.
         Codes with empty text or a scaled size under 1 point produce no Char but still
         advance. A Type 3 fmat changes the glyph orientation, not the origin.
+        Once the page holds MAX_PAGE_CHARS characters, or MAX_PAGE_CODES codes have been
+        shown on the page (also codes that produce no Char), the rest of the string is
+        not collected, the text matrix is returned as advanced so far and the limit is
+        recorded with problem().
         @param gs current graphics state
         @param tm current text matrix
         @param s string operand bytes
@@ -3103,7 +3878,15 @@ class PageContent:
             return tm
         fs, th = gs.fs, gs.th
         fmat = font.fmat
+        room = MAX_PAGE_CHARS - len(self.chars)
         for code, nb in font.codes(s):
+            if room <= 0:
+                problem('limit', 'page reached MAX_PAGE_CHARS (%d characters)' % MAX_PAGE_CHARS)
+                return tm
+            if self.code_count >= MAX_PAGE_CODES:
+                problem('limit', 'page reached MAX_PAGE_CODES (%d codes)' % MAX_PAGE_CODES)
+                return tm
+            self.code_count += 1
             m = mmul(tm, gs.ctm)
             ox, oy = apply(m, 0, gs.rise)
             if fmat:
@@ -3127,6 +3910,7 @@ class PageContent:
             c.invisible = gs.tr in (3, 7)
             c.est = font.estimated
             self.chars.append(c)
+            room -= 1
         return tm
 
 
@@ -3181,14 +3965,20 @@ def _merge_pass(groups, gap):
     """!
     @brief Merge every pair of groups whose boxes overlap within gap (one pass).
 
-    Pairs are found through a grid with cells of max(64, 4 * gap) points; connected
-    groups are joined with a union-find structure. A merged box can reach further
-    groups, so cluster() repeats the pass until the count stays the same.
+    Pairs are found through grids: level k has cells of max(64, 4 * gap) * 32^k points.
+    Each box goes into the lowest level where it occupies at most MAX_GRID_CELLS cells,
+    and is checked against the boxes in the cells it touches on its own level and on
+    every coarser level. Every overlapping pair is found once a box of the pair checks
+    the level of the other. A box with coordinates that are not finite, or that needs
+    more than GRID_LEVELS levels (larger than about 2.2e12 pt, beyond any valid page),
+    is not merged and stays a group of its own. Connected groups are joined with a
+    union-find structure. A merged box can reach further groups, so cluster() repeats
+    the pass until the count stays the same.
     @param groups list of [bbox list, member list, index of the last member in items]
     @param gap merge distance in points
     @return list of merged groups in the same form
     """
-    size = max(64.0, 4.0 * gap)
+    base = max(64.0, 4.0 * gap)
     parent = list(range(len(groups)))
 
     def find(i):
@@ -3197,22 +3987,45 @@ def _merge_pass(groups, gap):
             i = parent[i]
         return i
 
-    grid = {}
+    def join(i, j):
+        if _overlap(groups[j][0], groups[i][0], gap):
+            a, b = find(i), find(j)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+
+    def cells(bb, level):
+        size = base * 32.0**level
+        cx0, cx1 = (bb[0] - gap) // size, (bb[2] + gap) // size
+        cy0, cy1 = (bb[1] - gap) // size, (bb[3] + gap) // size
+        return cx0, cx1, cy0, cy1
+
+    grids = [{} for _ in range(GRID_LEVELS)]
+    placed = []  # (index, level); groups that fit no level stay unmerged
     for i, (bb, _, _) in enumerate(groups):
-        cx0, cx1 = int((bb[0] - gap) // size), int((bb[2] + gap) // size)
-        cy0, cy1 = int((bb[1] - gap) // size), int((bb[3] + gap) // size)
-        seen = set()
-        for cx in range(cx0, cx1 + 1):
-            for cy in range(cy0, cy1 + 1):
-                cell = grid.setdefault((cx, cy), [])
-                for j in cell:
-                    if j not in seen:
-                        seen.add(j)
-                        if _overlap(groups[j][0], bb, gap):
-                            a, b = find(i), find(j)
-                            if a != b:
-                                parent[max(a, b)] = min(a, b)
-                cell.append(i)
+        for level in range(GRID_LEVELS):
+            cx0, cx1, cy0, cy1 = cells(bb, level)
+            # also false for NaN and infinite coordinates, which int() would reject
+            if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) <= MAX_GRID_CELLS:
+                grid = grids[level]
+                for cx in range(int(cx0), int(cx1) + 1):
+                    for cy in range(int(cy0), int(cy1) + 1):
+                        grid.setdefault((cx, cy), []).append(i)
+                placed.append((i, level))
+                break
+    for i, own in placed:
+        bb = groups[i][0]
+        seen = {i}
+        for level in range(own, GRID_LEVELS):
+            grid = grids[level]
+            if not grid:
+                continue
+            cx0, cx1, cy0, cy1 = cells(bb, level)
+            for cx in range(int(cx0), int(cx1) + 1):
+                for cy in range(int(cy0), int(cy1) + 1):
+                    for j in grid.get((cx, cy), ()):
+                        if j not in seen:
+                            seen.add(j)
+                            join(i, j)
     out = {}
     for i, (bb, members, last) in enumerate(groups):
         root = find(i)
@@ -3252,11 +4065,34 @@ class Region:
 
     def signature(self):
         """!
-        @brief Return a key that identifies a figure repeated at the same place.
-        @return tuple of the bbox coordinates rounded to whole points and the shape count
+        @brief Return a key that identifies the same figure repeated at the same place.
+
+        The key holds the bbox rounded to whole points, the shape count, one entry per
+        shape and the lower-case text of the characters in the region with each digit
+        run replaced by #, so page numbers inside a header or footer figure match. An
+        image entry is the length and CRC-32 of the raw image stream bytes, so equal
+        images match even when stored as separate objects. A path entry lists its
+        segments with the coordinates rounded to whole points.
+        @return hashable tuple
         """
         b = self.bbox
-        return (round(b[0]), round(b[1]), round(b[2]), round(b[3]), len(self.shapes))
+        content = []
+        for s in self.shapes:
+            if s.kind == 'image':
+                raw = s.stream.raw if isinstance(s.stream, Stream) else b''
+                content.append(('image', len(raw), zlib.crc32(raw)))
+            else:
+                content.append(
+                    tuple(
+                        (g[0],) + tuple(round(v) if math.isfinite(v) else 0 for v in g[1:])
+                        for g in s.segs
+                    )
+                )
+        return (
+            (round(b[0]), round(b[1]), round(b[2]), round(b[3]), len(self.shapes)),
+            tuple(content),
+            re.sub(r'\d+', '#', ''.join(c.text for c in self.chars).lower()),
+        )
 
 
 class Line:
@@ -4029,7 +4865,8 @@ def _png(w, h, depth, ctype, data, palette=None):
     @brief Encode raw image samples as a PNG file.
 
     Each row is prefixed with filter type 0. The sample data is truncated or padded with
-    zero bytes to the exact size. IDAT data uses zlib level 6. No interlacing.
+    zero bytes to the exact size. IDAT data uses zlib level 6 and is compressed row by
+    row, so no uncompressed copy of the whole image is built. No interlacing.
 
     @param w Image width in pixels.
     @param h Image height in pixels.
@@ -4041,8 +4878,16 @@ def _png(w, h, depth, ctype, data, palette=None):
     """
     rowlen = (w * {0: 1, 2: 3, 3: 1}[ctype] * depth + 7) // 8
     need = rowlen * h
-    data = bytes(data[:need]).ljust(need, b'\0')
-    raw = b''.join(b'\0' + data[i * rowlen : (i + 1) * rowlen] for i in range(h))
+    if len(data) != need:
+        data = bytes(data[:need]).ljust(need, b'\0')
+    view = memoryview(data)
+    comp = zlib.compressobj(6)
+    parts = []
+    for i in range(h):
+        parts.append(comp.compress(b'\0'))
+        parts.append(comp.compress(view[i * rowlen : (i + 1) * rowlen]))
+    parts.append(comp.flush())
+    idat = b''.join(parts)
 
     def chunk(tag, body):
         """!
@@ -4064,7 +4909,7 @@ def _png(w, h, depth, ctype, data, palette=None):
     )
     if palette is not None:
         out += chunk(b'PLTE', palette)
-    return out + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b'')
+    return out + chunk(b'IDAT', idat) + chunk(b'IEND', b'')
 
 
 def _colorspace(doc, cs, res):
@@ -4143,6 +4988,8 @@ def _colorspace(doc, cs, res):
 
 ## @brief bytes.translate table that inverts 8-bit samples (v -> 255 - v).
 _INVERT = bytes(range(255, -1, -1))
+## @brief bytes.translate table that leaves 8-bit samples unchanged.
+_IDENTITY = bytes(range(256))
 ## @brief Images with more pixels than this (2^26, about 67 million) are not exported.
 MAX_IMAGE_PIXELS = 1 << 26
 
@@ -4164,7 +5011,105 @@ def _cmyk_to_rgb(data):
     return bytes(out)
 
 
-def image_file(doc, s, res):
+def _decode_pairs(r, decode, defaults):
+    """!
+    @brief Read the (Dmin, Dmax) pairs of an image /Decode array.
+
+    @param r Function that resolves references.
+    @param decode /Decode value, or None.
+    @param defaults Default pairs, one per color component.
+    @return List of (Dmin, Dmax) float pairs, one per component; the defaults when
+            decode is not an array of at least 2 finite numbers per component.
+    """
+    n = 2 * len(defaults)
+    if isinstance(decode, list) and len(decode) >= n:
+        try:
+            vals = [float(r(v)) for v in decode[:n]]
+        except (TypeError, ValueError):
+            vals = None
+        if vals and all(math.isfinite(v) for v in vals):
+            return [(vals[2 * i], vals[2 * i + 1]) for i in range(len(defaults))]
+    return list(defaults)
+
+
+def _decode_table(pair, maxv):
+    """!
+    @brief Build the sample mapping of one /Decode pair.
+
+    A sample v in 0..maxv maps to Dmin + v * (Dmax - Dmin) / maxv, clamped to 0..1 and
+    scaled back to 0..maxv.
+
+    @param pair (Dmin, Dmax) for a color range of 0..1.
+    @param maxv Largest sample value, 2^bits - 1.
+    @return List of maxv + 1 mapped sample values.
+    """
+    d0, d1 = pair
+    return [
+        int(round(max(0.0, min(1.0, d0 + v * (d1 - d0) / maxv)) * maxv)) for v in range(maxv + 1)
+    ]
+
+
+def _apply_decode(data, ncomp, bpc, pairs):
+    """!
+    @brief Map image samples through /Decode pairs for color ranges of 0..1.
+
+    Pairs (0, 1) leave a component unchanged and (1, 0) invert it. 8-bit samples go
+    through one 256-entry translate table per component. Below 8 bits (one component
+    only) one table maps each packed byte. 16-bit samples are inverted bytewise; other
+    16-bit intervals reduce the samples to their high byte first.
+
+    @param data Packed sample bytes, rows padded to whole bytes.
+    @param ncomp Number of color components.
+    @param bpc Bits per component: 1, 2, 4, 8 or 16.
+    @param pairs (Dmin, Dmax) per component.
+    @return Tuple (data, bpc) with the mapped samples and their bit depth; None for
+            several components below 8 bits.
+    """
+    if all(p == (0.0, 1.0) for p in pairs):
+        return data, bpc
+    if bpc < 8:
+        if ncomp != 1:
+            return None
+        maxv = (1 << bpc) - 1
+        smap = _decode_table(pairs[0], maxv)
+        tbl = bytearray(256)
+        for byte in range(256):
+            v = 0
+            for shift in range(8 - bpc, -1, -bpc):
+                v |= smap[(byte >> shift) & maxv] << shift
+            tbl[byte] = v
+        return data.translate(bytes(tbl)), bpc
+    if bpc == 16 and all(p in ((0.0, 1.0), (1.0, 0.0)) for p in pairs):
+        tables = [_INVERT if p == (1.0, 0.0) else _IDENTITY for p in pairs for _ in (0, 1)]
+    else:
+        if bpc == 16:
+            data, bpc = data[0::2], 8
+        tables = [bytes(_decode_table(p, 255)) for p in pairs]
+    if all(t == tables[0] for t in tables):
+        return data.translate(tables[0]), bpc
+    out = bytearray(data)
+    step = len(tables)
+    for i, t in enumerate(tables):
+        if t != _IDENTITY:
+            out[i::step] = data[i::step].translate(t)
+    return bytes(out), bpc
+
+
+def _why(why, kind, text):
+    """!
+    @brief Record why image_file returns no file.
+
+    @param why List that receives (kind, text), or None.
+    @param kind Problem kind for problem(): 'unsupported', 'malformed' or 'limit'.
+    @param text Cause, without the image name.
+    @return None.
+    """
+    if why is not None:
+        why.append((kind, text))
+    return None
+
+
+def image_file(doc, s, res, why=None):
     """!
     @brief Convert an image XObject to a file format.
 
@@ -4173,85 +5118,116 @@ def image_file(doc, s, res):
     Separation (1, 2, 4, 8 or 16 bits), RGB (8 or 16 bits), Lab (8 bits, converted
     with _lab_rgb), Indexed (1, 2, 4 or 8 bits, at most 2^bits palette entries) and
     CMYK (8 bits, converted to RGB). Image masks are treated as 1-bit gray.
-    A Decode array starting [1 0] inverts the samples; Separation samples are inverted
-    by default. When the color space is unknown, the component count is guessed from
-    the data length. Images with a width or height below 1, more than
-    MAX_IMAGE_PIXELS pixels, or a declared size above twice the data length plus
-    64 KiB are unsupported.
+    /Decode maps each component (see _apply_decode); Separation samples are inverted
+    after it, since a full tint is dark. Lab uses the /Decode ranges for L*, a* and b*.
+    For Indexed only the default and the reversed index range [2^bits-1 0] are
+    supported. When the color space is unknown, the component count is guessed from
+    the data length. Images with a declared width or height below 1 or above
+    MAX_IMAGE_SIDE, more than MAX_IMAGE_PIXELS pixels, or a declared size above twice
+    the data length plus 64 KiB are not exported; the size limits also apply to JPEG
+    and JPEG 2000. A soft mask (/SMask) is ignored.
 
     @param doc Document used to resolve references and decode the stream.
     @param s Image XObject stream.
     @param res Resource dictionary for named color spaces.
+    @param why List that receives (kind, text) for each reason the result is None or
+           incomplete, or None.
     @return Tuple (extension, bytes) with extension 'jpg', 'jp2' or 'png'; None when
             unsupported.
     """
     r = doc.resolve
-    data, native = doc.decode(s)
+    w = r(s.get('Width', s.get('W')))
+    h = r(s.get('Height', s.get('H')))
+    if not all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (w, h)
+    ):
+        return _why(why, 'malformed', 'no valid /Width and /Height')
+    w, h = int(w), int(h)
+    if w <= 0 or h <= 0:
+        return _why(why, 'malformed', 'size %d x %d' % (w, h))
+    if w > MAX_IMAGE_SIDE or h > MAX_IMAGE_SIDE or w * h > MAX_IMAGE_PIXELS:
+        return _why(
+            why,
+            'limit',
+            'size %d x %d above MAX_IMAGE_SIDE (%d) or MAX_IMAGE_PIXELS (%d)'
+            % (w, h, MAX_IMAGE_SIDE, MAX_IMAGE_PIXELS),
+        )
+    try:
+        data, native = doc.decode(s)
+    except PDFError as exc:
+        return _why(why, 'unsupported', str(exc))
     if native in ('DCTDecode', 'DCT'):
         return ('jpg', data)
     if native == 'JPXDecode':
         return ('jp2', data)
     if native:
-        return None
-    w = int(r(s.get('Width', s.get('W'))))
-    h = int(r(s.get('Height', s.get('H'))))
+        return _why(why, 'unsupported', '%s not exported' % native)
     decode = r(s.get('Decode', s.get('D')))
-    inverted = (
-        isinstance(decode, list) and len(decode) >= 2 and r(decode[0]) == 1 and r(decode[1]) == 0
-    )
     if r(s.get('ImageMask', s.get('IM'))):
         cs, bpc = ('gray', 1), 1
     else:
-        bpc = int(r(s.get('BitsPerComponent', s.get('BPC'))) or 8)
+        bpc = r(s.get('BitsPerComponent', s.get('BPC'))) or 8
+        if isinstance(bpc, float) and bpc.is_integer():
+            bpc = int(bpc)
         cs = _colorspace(doc, s.get('ColorSpace', s.get('CS')), res)
         if cs is None:
-            n = round(len(data) * 8 / max(1, w * h * bpc))
+            n = round(len(data) * 8 / max(1, w * h * bpc)) if bpc in (1, 2, 4, 8, 16) else 0
             cs = {1: ('gray', 1), 3: ('rgb', 3), 4: ('cmyk', 4)}.get(n)
             if cs is None:
-                return None
+                return _why(why, 'unsupported', 'color space not exported')
     ncomp = cs[1]
-    if w <= 0 or h <= 0 or bpc not in (1, 2, 4, 8, 16) or w * h > MAX_IMAGE_PIXELS:
-        return None
+    if bpc not in (1, 2, 4, 8, 16):
+        return _why(why, 'malformed', '/BitsPerComponent %r' % (bpc,))
     rowlen = (w * ncomp * bpc + 7) // 8
     need = rowlen * h
     if need > 2 * len(data) + 65536:
-        return None  # far less data than the declared size: corrupt or hostile
+        # far less data than the declared size: corrupt or hostile
+        return _why(why, 'malformed', 'declared size %d x %d far above the data' % (w, h))
     data = bytes(data[:need]).ljust(need, b'\0')
     kind = cs[0]
-    if kind in ('gray', 'sep'):
-        if inverted != (kind == 'sep'):
-            data = data.translate(_INVERT)
-        return ('png', _png(w, h, bpc, 0, data))
-    elif kind == 'rgb' and bpc in (8, 16):
-        return ('png', _png(w, h, bpc, 2, data))
-    elif kind == 'lab' and bpc == 8:
-        wp, rng = cs[2], cs[3]
+    if kind == 'lab' and bpc == 8:
+        rng = cs[3]
+        d = _decode_pairs(r, decode, [(0.0, 100.0), (rng[0], rng[1]), (rng[2], rng[3])])
+        wp = cs[2]
         out = bytearray(len(data))
         memo = {}
         for i in range(0, len(data) - 2, 3):
             key = data[i : i + 3]
             v = memo.get(key)
             if v is None:
-                L, a, b = key
-                c = _lab_rgb(
-                    (
-                        L * 100 / 255.0,
-                        rng[0] + a * (rng[1] - rng[0]) / 255.0,
-                        rng[2] + b * (rng[3] - rng[2]) / 255.0,
-                    ),
-                    wp,
-                )
+                if len(memo) >= MAX_LAB_MEMO:
+                    memo.clear()
+                c = _lab_rgb([d[j][0] + key[j] * (d[j][1] - d[j][0]) / 255.0 for j in range(3)], wp)
                 v = memo[key] = bytes(int(round(x * 255)) for x in c)
             out[i : i + 3] = v
         return ('png', _png(w, h, 8, 2, bytes(out)))
-    elif kind == 'indexed' and bpc in (1, 2, 4, 8):
+    if kind == 'indexed' and bpc in (1, 2, 4, 8):
+        top = float((1 << bpc) - 1)
+        d = _decode_pairs(r, decode, [(0.0, top)])[0]
+        if d == (top, 0.0):
+            data = data.translate(_INVERT)  # bitwise NOT reverses every packed index
+        elif d != (0.0, top):
+            return _why(why, 'unsupported', 'Indexed /Decode %s not exported' % list(d))
         pal = bytearray()
         for i in range(min(cs[3], 2**bpc - 1) + 1):  # PNG allows 2^bitdepth entries
             pal += bytes(int(round(x * 255)) for x in _index_rgb(cs, i))
         return ('png', _png(w, h, bpc, 3, data, bytes(pal)))
-    elif kind == 'cmyk' and bpc == 8:
-        return ('png', _png(w, h, 8, 2, _cmyk_to_rgb(data)))
-    return None
+    if (kind in ('gray', 'sep') and ncomp == 1) or (
+        kind in ('rgb', 'cmyk') and bpc in (8, 16) and (bpc == 8 or kind == 'rgb')
+    ):
+        d = _decode_pairs(r, decode, [(0.0, 1.0)] * ncomp)
+        if kind == 'sep':  # tint 1 is full ink: gray 1 - tint
+            d = [(1.0 - a, 1.0 - b) for a, b in d]
+        mapped = _apply_decode(data, ncomp, bpc, d)
+        if mapped is None:
+            return _why(why, 'unsupported', '/Decode not exported')
+        data, bpc = mapped
+        if kind == 'cmyk':
+            return ('png', _png(w, h, 8, 2, _cmyk_to_rgb(data)))
+        return ('png', _png(w, h, bpc, 2 if kind == 'rgb' else 0, data))
+    return _why(
+        why, 'unsupported', 'color space %s with %s bits not exported' % (kind.upper(), bpc)
+    )
 
 
 def _link(rel):
@@ -4320,6 +5296,71 @@ def _family(c):
     return 'Times New Roman, serif' if c.serif else 'Helvetica, Arial, sans-serif'
 
 
+def _svg_image(m, f):
+    """!
+    @brief Build an SVG image element that places an image like the PDF Do operator.
+
+    The unit square of the image is mapped by the placement matrix m. Image row 0
+    is at the top of the unit square (y = 1), as PDF requires. The element is meant
+    for a group whose y axis points up (PDF user space).
+
+    @param m Placement matrix [a b c d e f] (CTM at the Do operator).
+    @param f Tuple (extension, bytes) with extension 'png' or 'jpg'.
+    @return SVG image element with the image as a base64 data URI.
+    """
+    mime = 'image/png' if f[0] == 'png' else 'image/jpeg'
+    return (
+        '<image width="1" height="1" preserveAspectRatio="none" '
+        'transform="matrix(%s) matrix(1 0 0 -1 0 1)" xlink:href="data:%s;base64,%s"/>'
+        % (' '.join(_fmt(v) for v in m), mime, base64.b64encode(f[1]).decode('ascii'))
+    )
+
+
+def _upright(m):
+    """!
+    @brief Tell whether an image placement shows the image in its stored orientation.
+
+    True when the x and y scales are positive and the shear terms are below 0.1 % of
+    the larger scale. Then the image file looks like the page without a transform.
+
+    @param m Placement matrix [a b c d e f].
+    @return True for an upright, unmirrored, unsheared placement.
+    """
+    a, b, c, d = m[:4]
+    tol = 1e-3 * max(abs(a), abs(d))
+    return a > 0 and d > 0 and abs(b) <= tol and abs(c) <= tol
+
+
+def image_svg(shape, f):
+    """!
+    @brief Wrap one placed image in an SVG document that applies its placement matrix.
+
+    The view is the image's bounding box on the page; width and height are in points.
+    The image is drawn rotated, mirrored or sheared as on the page (see _svg_image).
+
+    @param shape Image shape with bbox and matrix.
+    @param f Tuple (extension, bytes) with extension 'png' or 'jpg'.
+    @return SVG text ending with a newline.
+    """
+    x0, y0, x1, y1 = shape.bbox
+    w, h = x1 - x0, y1 - y0
+    return (
+        '\n'.join(
+            [
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'xmlns:xlink="http://www.w3.org/1999/xlink" '
+                'width="%spt" height="%spt" viewBox="0 0 %s %s">'
+                % (_fmt(w), _fmt(h), _fmt(w), _fmt(h)),
+                '<g transform="matrix(1 0 0 -1 %s %s)">' % (_fmt(-x0), _fmt(y1)),
+                _svg_image(shape.matrix, f),
+                '</g>',
+                '</svg>',
+            ]
+        )
+        + '\n'
+    )
+
+
 def region_svg(reg, box, raster_for):
     """!
     @brief Render a figure region as a standalone SVG document.
@@ -4364,13 +5405,7 @@ def region_svg(reg, box, raster_for):
         else:
             f = raster_for(s)
             if f and f[0] in ('png', 'jpg'):
-                mime = 'image/png' if f[0] == 'png' else 'image/jpeg'
-                m = s.matrix
-                out.append(
-                    '<image width="1" height="1" preserveAspectRatio="none" '
-                    'transform="matrix(%s) matrix(1 0 0 -1 0 1)" xlink:href="data:%s;base64,%s"/>'
-                    % (' '.join(_fmt(v) for v in m), mime, base64.b64encode(f[1]).decode('ascii'))
-                )
+                out.append(_svg_image(s.matrix, f))
     out.append('</g>')
     visible = [c for c in reg.chars if not c.invisible]
     for ln in build_lines(visible, split=0.9):
@@ -4447,8 +5482,8 @@ class Exporter:
     - assets_dir: directory that receives the figure files.
     - md_dir: directory of the Markdown file; links are relative to it.
     - cache: converted images keyed by id of the image stream; None for failures.
-    - files: (alt text, file path) of written raster images keyed by id of the image
-      stream; a repeated image reuses both.
+    - files: (alt text, file path) of written raster images keyed by (id of the image
+      stream, appearance); a repeated image with the same appearance reuses both.
     - counts: Counter of exported figures per label ('Image', 'Table', 'Figure').
     """
 
@@ -4468,41 +5503,69 @@ class Exporter:
         self.md_dir = md_dir
         ## converted images keyed by id of the image stream; None for failures.
         self.cache = {}
-        ## (alt text, file path) of written raster images keyed by id of the image
-        ## stream; a repeated image reuses both.
+        ## (alt text, file path) of written raster images keyed by (id of the image
+        ## stream, appearance); a repeated image with the same appearance reuses both.
         self.files = {}
         ## Counter of exported figures per label ('Image', 'Table', 'Figure').
         self.counts = Counter()
+
+    @staticmethod
+    def _image_name(stream):
+        """!
+        @brief Name an image stream for problem reports.
+
+        @param stream Image XObject stream.
+        @return 'image N G R' with its object and generation number, or 'image' for a
+                direct object.
+        """
+        return 'image' + stream.label()[len('stream') :]
 
     def raster(self, shape):
         """!
         @brief Convert an image shape to a file format, with caching per image stream.
 
-        Any exception during conversion is caught and cached as None.
+        Each reason why the image is not exported, or exported incompletely, is
+        recorded once with problem(); an exception during conversion is recorded as
+        'internal' and cached as None.
 
         @param shape Image shape with stream and resources.
         @return Tuple (extension, bytes) from image_file, or None.
         """
         key = id(shape.stream)
         if key not in self.cache:
+            why = []
             try:
-                self.cache[key] = image_file(self.doc, shape.stream, shape.resources)
-            except Exception:
+                self.cache[key] = image_file(self.doc, shape.stream, shape.resources, why)
+            except Exception as exc:
                 self.cache[key] = None
+                why.append(
+                    ('internal', '%s: %s' % (type(exc).__name__, ' '.join(str(exc).split())))
+                )
+            for kind, text in why:
+                problem(kind, '%s: %s' % (self._image_name(shape.stream), text))
         return self.cache[key]
+
+    ## @brief Path of the input PDF file; _write refuses a target that refers to it.
+    ## None skips the check. convert() and convert_split() set it.
+    source = None
 
     def _write(self, name, data):
         """!
         @brief Write a file into the assets directory, creating the directory if needed.
 
+        The file is written through a temporary file and os.replace (see _write_atomic),
+        so an existing file stays intact when the write fails.
+
         @param name File name.
         @param data File contents as bytes.
         @return Path of the written file.
+        @exception UsageError when the target refers to the input file (see _check_output).
         """
         os.makedirs(self.assets_dir, exist_ok=True)
         path = os.path.join(self.assets_dir, name)
-        with open(path, 'wb') as fh:
-            fh.write(data)
+        if self.source is not None:
+            _check_output(path, self.source)
+        _write_atomic(path, data)
         return path
 
     def _rel(self, path):
@@ -4527,9 +5590,14 @@ class Exporter:
 
         Raster regions are labelled 'Image', other regions 'Table' or 'Figure' (see
         region_label). The alt text is the label and its running number; only exported
-        figures are numbered. A raster image already written for the same stream is
-        linked again with the same file and alt text. Raster
-        files are named pNNN_imgN.ext and vector figures pNNN_<label>N.svg.
+        figures are numbered. A raster image placed upright (see _upright) is written
+        as its file; one placed rotated, mirrored or sheared, including by the page
+        rotation, is written as an SVG that applies the placement (see image_svg).
+        JPEG 2000 cannot be embedded in SVG and is written as its file; the lost
+        transform is reported. A raster image already written for the same stream and
+        the same appearance (upright, or the same linear part of the matrix) is linked
+        again with the same file and alt text. Raster files are named pNNN_imgN.ext and
+        vector figures pNNN_@<label@>N.svg. Problems are recorded for this page.
 
         @param page 1-based page number used in the file name.
         @param box Displayed page box (x0, y0, x1, y1) in points.
@@ -4537,27 +5605,56 @@ class Exporter:
         @return Markdown image link, or an HTML comment when the image encoding is
                 unsupported.
         """
-        label = 'Image' if reg.raster else region_label(reg)
-        if reg.raster:
-            key = id(reg.raster.stream)
-            if key in self.files:  # same image again: same file and number
-                alt, path = self.files[key]
+        before = _CURRENT_PAGE[0]
+        _CURRENT_PAGE[0] = page
+        try:
+            label = 'Image' if reg.raster else region_label(reg)
+            if reg.raster:
+                sh = reg.raster
+                f = self.raster(sh)
+                if f is None:
+                    return (
+                        '<!-- image on page %d not exported: unsupported image encoding -->' % page
+                    )
+                svg = f[0] in ('png', 'jpg') and not _upright(sh.matrix)
+                look = tuple(round(v, 2) for v in sh.matrix[:4]) if svg else None
+                key = (id(sh.stream), look)
+                if key in self.files:  # same image and appearance again: same file and number
+                    alt, path = self.files[key]
+                    return '![%s](%s)' % (alt, self._rel(path))
+                if not svg and not _upright(sh.matrix):
+                    problem(
+                        'unsupported',
+                        '%s: JPEG 2000 image written without its rotation, mirroring or shear'
+                        % self._image_name(sh.stream),
+                    )
+                self.counts[label] += 1
+                n = self.counts[label]
+                alt = '%s %d' % (label, n)
+                if svg:
+                    data = image_svg(sh, f).encode('utf-8')
+                    path = self._write('p%03d_img%d.svg' % (page, n), data)
+                else:
+                    path = self._write('p%03d_img%d.%s' % (page, n, f[0]), f[1])
+                self.files[key] = (alt, path)
                 return '![%s](%s)' % (alt, self._rel(path))
-            f = self.raster(reg.raster)
-            if f is None:
-                return '<!-- image on page %d not exported: unsupported image encoding -->' % page
+            for s in reg.shapes:
+                if s.kind == 'image':
+                    f = self.raster(s)
+                    if f is not None and f[0] not in ('png', 'jpg'):
+                        problem(
+                            'unsupported',
+                            '%s: JPEG 2000 image not embedded in SVG figure'
+                            % self._image_name(s.stream),
+                        )
             self.counts[label] += 1
             n = self.counts[label]
             alt = '%s %d' % (label, n)
-            path = self._write('p%03d_img%d.%s' % (page, n, f[0]), f[1])
-            self.files[key] = (alt, path)
+            svg = region_svg(reg, box, self.raster)
+            path = self._write('p%03d_%s%d.svg' % (page, label.lower(), n), svg.encode('utf-8'))
             return '![%s](%s)' % (alt, self._rel(path))
-        self.counts[label] += 1
-        n = self.counts[label]
-        alt = '%s %d' % (label, n)
-        svg = region_svg(reg, box, self.raster)
-        path = self._write('p%03d_%s%d.svg' % (page, label.lower(), n), svg.encode('utf-8'))
-        return '![%s](%s)' % (alt, self._rel(path))
+        finally:
+            _CURRENT_PAGE[0] = before
 
 
 # ---------------------------------------------------------------------------
@@ -4938,8 +6035,10 @@ def _drop_repeats(layouts):
     The header and footer bands are the top and bottom 10 % of the page box height. A
     band line is dropped when its lowercase text, with digit runs replaced by #, occurs
     in the same band on at least max(3, 0.5 x page count) pages, or when it is a bare
-    page number (_PAGENUM_RE). With at least 3 pages, figure regions whose signature
-    (rounded box and shape count) occurs at least as often are dropped too.
+    page number (_PAGENUM_RE). With at least 3 pages, a figure region that lies wholly
+    inside one of the bands is dropped when its Region.signature (rounded box, shapes
+    and their content, and text) occurs in a band on at least as many pages. Figures
+    that reach outside the bands are always kept.
 
     @param layouts List of PageLayout objects; lines and regions are updated in place.
     """
@@ -4947,6 +6046,7 @@ def _drop_repeats(layouts):
     limit = max(3, 0.5 * n)
     keys = Counter()
     sigs = Counter()
+    band_sigs = {}  # id(region) -> signature, for regions wholly inside a band
     for lay in layouts:
         h = lay.box[3] - lay.box[1]
         top_band, bot_band = lay.box[3] - 0.1 * h, lay.box[1] + 0.1 * h
@@ -4955,7 +6055,16 @@ def _drop_repeats(layouts):
             if l.y >= top_band or l.y <= bot_band:
                 page_keys.add((re.sub(r'\d+', '#', l.text.lower()), l.y >= top_band))
         keys.update(page_keys)
-        sigs.update({r.signature() for r in lay.regions})
+        if n >= 3:
+            page_sigs = set()
+            for r in lay.regions:
+                b = r.bbox
+                if (top_band <= b[1] and b[3] <= lay.box[3]) or (
+                    lay.box[1] <= b[1] and b[3] <= bot_band
+                ):
+                    band_sigs[id(r)] = r.signature()
+                    page_sigs.add(band_sigs[id(r)])
+            sigs.update(page_sigs)
     for lay in layouts:
         h = lay.box[3] - lay.box[1]
         top_band, bot_band = lay.box[3] - 0.1 * h, lay.box[1] + 0.1 * h
@@ -4969,8 +6078,9 @@ def _drop_repeats(layouts):
                 continue
             kept.append(l)
         lay.lines = kept
-        if n >= 3:
-            lay.regions = [r for r in lay.regions if sigs[r.signature()] < limit]
+        lay.regions = [
+            r for r in lay.regions if id(r) not in band_sigs or sigs[band_sigs[id(r)]] < limit
+        ]
 
 
 def _heading_levels(layouts):
@@ -5135,9 +6245,9 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
     @brief Parse the file and lay out the selected pages.
 
     Page headers and footers are removed from the layouts (see _drop_repeats). A page
-    whose content fails to process is logged and kept as an empty layout. When /Rotate
-    is set but less than half the text reads upright, the unrotated view is used if it
-    has more upright characters.
+    whose content fails to process is recorded with problem() and kept as an empty
+    layout. When /Rotate is set but less than half the text reads upright, the
+    unrotated view is used if it has more upright characters.
 
     @param pdf_path Path of the PDF file.
     @param pages PageSelection (or set) of 1-based page numbers to process; None for all.
@@ -5148,6 +6258,8 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
                or it has no pages.
     @exception UsageError when no selected page exists in the document.
     """
+    PROBLEMS.clear()
+    _CURRENT_PAGE[0] = None
     with open(pdf_path, 'rb') as fh:
         data = fh.read()
     try:
@@ -5179,6 +6291,7 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
             continue
         if log:
             log('page %d/%d' % (i, len(page_list)))
+        _CURRENT_PAGE[0] = i
         box = _box(doc, inh)
         try:
             contents = doc.resolve(page.get('Contents'))
@@ -5205,10 +6318,15 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
                     pc, rbox = alt, box
             box = rbox
             layouts.append(layout_page(i, pc, box, figures))
+            if figures and pc.inline_images:
+                problem(
+                    'unsupported',
+                    '%d inline image(s) (BI/ID/EI) not exported' % pc.inline_images,
+                )
         except Exception as exc:
-            if log:
-                log('page %d skipped: %s' % (i, exc))
+            problem('internal', 'page skipped (%s: %s)' % (type(exc).__name__, exc))
             layouts.append(PageLayout(i, box, [], []))
+    _CURRENT_PAGE[0] = None
     _drop_repeats(layouts)
     return doc, page_list, layouts
 
@@ -5236,9 +6354,106 @@ def _page_markdown(writer, exporter, lay, marker=None):
             writer.add_line(obj)
 
 
+def _same_file(path, source):
+    """!
+    @brief Tell whether a path refers to the same file as the source path.
+
+    True when both resolve to the same path after following symbolic links
+    (os.path.realpath), or when both exist and os.stat (which follows links) gives the
+    same device and a non-zero inode number, which also matches hard links.
+
+    @param path Output path; it need not exist.
+    @param source Path of the input file.
+    @return True when writing to path through open() would change source.
+    """
+    try:
+        if os.path.normcase(os.path.realpath(path)) == os.path.normcase(os.path.realpath(source)):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        a, b = os.stat(path), os.stat(source)
+    except (OSError, ValueError):
+        return False
+    return a.st_ino != 0 and os.path.samestat(a, b)
+
+
+def _check_output(path, source):
+    """!
+    @brief Refuse an output path that refers to the input file.
+
+    @param path Output path.
+    @param source Path of the input file.
+    @exception UsageError when path refers to source (see _same_file).
+    """
+    if _same_file(path, source):
+        raise UsageError(
+            'the output path %s refers to the input file %s; choose another one with -o'
+            % (path, source)
+        )
+
+
+def _write_atomic(path, data):
+    """!
+    @brief Write a file through a temporary file in the same directory and os.replace.
+
+    The temporary file name is .~, 8 random hex digits and .tmp (14 characters), so
+    the path stays short on Windows. It is created exclusively with mode 0666 minus
+    the umask; it takes the mode of an existing regular file at path. os.replace then
+    swaps it in; a symbolic link at path is replaced by the file, its target is not
+    written. On Windows, os.replace is retried up to 5 times within about 1.5 s on
+    PermissionError, which a virus scanner or indexer holding the file causes. When
+    anything fails, the temporary file is made writable and removed, and an existing
+    file at path keeps its content.
+
+    @param path Target path; its directory must exist.
+    @param data File contents as bytes.
+    @exception OSError when the file cannot be written or replaced.
+    """
+    folder = os.path.dirname(os.path.abspath(path))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+    for _ in range(100):
+        tmp = os.path.join(folder, '.~%s.tmp' % os.urandom(4).hex())
+        try:
+            fd = os.open(tmp, flags, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError('cannot create a temporary file in %s' % folder)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            st = None
+        if st is not None and (st.st_mode & 0o170000) == 0o100000:  # regular file
+            os.chmod(tmp, st.st_mode & 0o7777)
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if os.name != 'nt' or attempt == 5:
+                    raise
+                time.sleep(0.05 * 2**attempt)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)  # a copied read-only mode blocks removal on Windows
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def convert(pdf_path, md_path, assets_dir, pages=None, page_markers=False, figures=True, log=None):
     """!
     @brief Write one Markdown file for the whole document.
+
+    An output path that refers to the input file (same path, symbolic link or hard link)
+    is refused before the input is read. Every file is written through a temporary file
+    (see _write_atomic).
 
     @param pdf_path Path of the PDF file.
     @param md_path Path of the Markdown file to write (UTF-8, LF line endings).
@@ -5248,18 +6463,25 @@ def convert(pdf_path, md_path, assets_dir, pages=None, page_markers=False, figur
     @param figures False to skip figure export.
     @param log Function that receives progress messages, or None.
     @return Counter of exported figures per label.
+    @exception UsageError when md_path or a figure file refers to the input file.
     """
+    _check_output(md_path, pdf_path)
     doc, _, layouts = analyze(pdf_path, pages, figures, log)
     md_dir = os.path.dirname(os.path.abspath(md_path))
     os.makedirs(md_dir, exist_ok=True)
     exporter = Exporter(doc, assets_dir, md_dir)
+    exporter.source = pdf_path
     writer = MarkdownWriter(_heading_levels(layouts))
-    for lay in layouts:
-        _page_markdown(
-            writer, exporter, lay, '<!-- page %d -->' % lay.number if page_markers else None
-        )
-    with open(md_path, 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write(writer.text())
+    try:
+        for lay in layouts:
+            _CURRENT_PAGE[0] = lay.number
+            _page_markdown(
+                writer, exporter, lay, '<!-- page %d -->' % lay.number if page_markers else None
+            )
+    finally:
+        _CURRENT_PAGE[0] = None
+    _check_output(md_path, pdf_path)
+    _write_atomic(md_path, writer.text().encode('utf-8'))
     return exporter.counts
 
 
@@ -5611,6 +6833,11 @@ def convert_split(
     are named page_NNNN.md, zero-padded to at least 4 digits. index.md lists the outline
     entries with links to their start pages, or all page files when there is no outline.
 
+    An outline or page label tree that cannot be read is recorded with problem(). An
+    output path (a page file, index.md or a figure file) that refers to the input file
+    is refused; page files and index.md are checked before anything is written. Every
+    file is written through a temporary file (see _write_atomic).
+
     @param pdf_path Path of the PDF file.
     @param out_dir Output directory.
     @param assets_dir Directory for figure files; None uses out_dir/_assets.
@@ -5619,7 +6846,10 @@ def convert_split(
     @param toc_depth Outline levels that become folders; 0 for no folders and no outline.
     @param log Function that receives progress messages, or None.
     @return Tuple (figure counts, number of page files, number of outline entries).
+    @exception UsageError when an output file refers to the input file.
     """
+    index_path = os.path.join(os.path.abspath(out_dir), 'index.md')
+    _check_output(index_path, pdf_path)
     doc, page_list, layouts = analyze(pdf_path, pages, figures, log)
     numbers = {id(p): n for n, (p, _) in enumerate(page_list, 1)}
     source = None
@@ -5629,15 +6859,17 @@ def convert_split(
             outline = doc.outline(numbers)
         except Exception as exc:  # malformed outline: continue without it
             outline = []
-            if log:
-                log('outline not readable: %s' % exc)
+            problem('malformed', 'outline not readable (%s: %s)' % (type(exc).__name__, exc))
         if outline:
             source = 'PDF outline (bookmarks)'
         else:
             try:
                 labels = doc.page_labels(len(page_list))
-            except Exception:
+            except Exception as exc:
                 labels = None
+                problem(
+                    'malformed', 'page labels not readable (%s: %s)' % (type(exc).__name__, exc)
+                )
             outline, toc_pages = printed_toc(layouts, labels, log, len(page_list))
             if outline:
                 source = 'printed table of contents on page %s' % _page_span(toc_pages)
@@ -5650,9 +6882,11 @@ def convert_split(
     os.makedirs(out_dir, exist_ok=True)
     assets_dir = os.path.abspath(assets_dir or os.path.join(out_dir, '_assets'))
     exporter = Exporter(doc, assets_dir, out_dir)
+    exporter.source = pdf_path
     levels = _heading_levels(layouts)
     width = max(4, len(str(len(page_list))))
     files = {}
+    plan = []  # (layout, folder, page file path)
     running = None  # last outline entry started before the current page
     started = sorted(on_page)
     si = 0
@@ -5674,14 +6908,22 @@ def convert_split(
             k = running
         parts = entries[k][1] if k is not None else []
         folder = os.path.join(out_dir, *parts)
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, 'page_%0*d.md' % (width, lay.number))
-        exporter.md_dir = folder
-        writer = MarkdownWriter(levels)
-        _page_markdown(writer, exporter, lay)
-        with open(path, 'w', encoding='utf-8', newline='\n') as fh:
-            fh.write(writer.text())
-        files[lay.number] = path
+        plan.append((lay, folder, os.path.join(folder, 'page_%0*d.md' % (width, lay.number))))
+    for _, _, path in plan:
+        _check_output(path, pdf_path)
+    _check_output(index_path, pdf_path)
+    try:
+        for lay, folder, path in plan:
+            _CURRENT_PAGE[0] = lay.number
+            os.makedirs(folder, exist_ok=True)
+            exporter.md_dir = folder
+            writer = MarkdownWriter(levels)
+            _page_markdown(writer, exporter, lay)
+            _check_output(path, pdf_path)
+            _write_atomic(path, writer.text().encode('utf-8'))
+            files[lay.number] = path
+    finally:
+        _CURRENT_PAGE[0] = None
     rel = lambda p: _link(os.path.relpath(p, out_dir))
     title = os.path.splitext(os.path.basename(pdf_path))[0]
     lines = ['# ' + _esc(title), '']
@@ -5698,8 +6940,8 @@ def convert_split(
     else:
         for n in sorted(files):
             lines.append('- [Page %d](%s)' % (n, rel(files[n])))
-    with open(os.path.join(out_dir, 'index.md'), 'w', encoding='utf-8', newline='\n') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _check_output(index_path, pdf_path)
+    _write_atomic(index_path, ('\n'.join(lines) + '\n').encode('utf-8'))
     return exporter.counts, len(files), len(entries)
 
 
@@ -5729,13 +6971,16 @@ def main(argv=None):
     output directory defaults to the input name without extension. Progress goes to
     stderr unless -q is given.
 
-    An output path equal to the input file is rejected. Unexpected errors while
-    reading the file (for example MemoryError) are reported in one line with exit
-    code 2, without a traceback.
+    An output path equal to the input file is rejected here; convert() and
+    convert_split() also refuse output files that are symbolic or hard links to it.
+    Unexpected errors while reading the file (for example MemoryError) are reported in
+    one line with exit code 2, without a traceback, also when part of the output was
+    already written. Recorded problems are printed on stderr, also with -q.
 
     @param argv Argument list; None uses sys.argv.
     @return Exit status: 0 on success, 1 for usage and file errors, 2 for files that
-            cannot be parsed and other conversion errors.
+            cannot be parsed and other conversion errors, 3 when the output was written
+            but PROBLEMS is not empty.
     """
     ap = _ArgumentParser(description='Convert a text-based PDF file to Markdown.')
     ap.add_argument('pdf', help='input PDF file')
@@ -5839,6 +7084,11 @@ def main(argv=None):
             )
         else:
             log('wrote %s (%s)' % (out, summary))
+    if PROBLEMS:
+        for line in problem_lines():
+            print('pdf2md: %s' % line, file=sys.stderr)
+        print('pdf2md: the output is incomplete', file=sys.stderr)
+        return 3
     return 0
 
 

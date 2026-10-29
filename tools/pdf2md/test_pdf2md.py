@@ -13,14 +13,20 @@ PDF2MD=/path/to/pdf2md.py python test_pdf2md.py
 @endcode
 """
 
+import contextlib
+import errno
 import importlib.util
+import io
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
+import unittest.mock as mock
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -211,7 +217,7 @@ class Parsing(Base):
         _write(f, data)
         t = time.time()
         rc, _ = self.md(f)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 3)  # the cut font tables are reported as 'limit' problems
         self.assertLess(time.time() - t, 20)
 
     def test_form_fan_out_is_bounded(self):
@@ -230,7 +236,7 @@ class Parsing(Base):
         make_pdf(f, HELLO + b'/X0 Do', objs, resources=b'/XObject << /X0 6 0 R >>')
         t = time.time()
         rc, text = self.md(f, timeout=120)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 3)  # MAX_FORM_RUNS cut the page: reported as incomplete
         self.assertIn('Hello world', text)
         self.assertLess(time.time() - t, 60)
 
@@ -370,6 +376,246 @@ class Parsing(Base):
         self.assertIn('Via gs', text)
 
 
+class ParserStructure(Base):
+    """!
+    @brief Cross-reference chain, trailer search and decoder output limits.
+    """
+
+    @staticmethod
+    def shifted(data):
+        """!
+        @brief Insert 21 bytes into the page tree node of a make_pdf file, so that the
+        cross-reference offsets of the later objects no longer point to them.
+        @param data file bytes
+        @return the edited bytes
+        """
+        return data.replace(b'/Count 1', b'/Count 1 /Pad (offsets shift)')
+
+    def update(self, f, body, xref):
+        """!
+        @brief Append an incremental update with a classic cross-reference table.
+        @param f PDF file written by make_pdf
+        @param body list of (object number, object bytes) to append
+        @param xref list of (object number, 'n' or 'f', generation); 'n' entries take
+               the offset of the object appended with that number
+        @return the new file bytes
+        """
+        data = _readb(f)
+        prev = int(data[data.rfind(b'startxref') + 9 :].split()[0])
+        offs = {}
+        for num, obj in body:
+            offs[num] = len(data)
+            data += b'%d 0 obj\n' % num + obj + b'\nendobj\n'
+        x = len(data)
+        data += b'xref\n0 1\n0000000000 65535 f \n'
+        for num, kind, gen in xref:
+            off = offs[num] if kind == 'n' else 0
+            data += b'%d 1\n%010d %05d %s \n' % (num, off, gen, kind.encode())
+        data += b'trailer\n<< /Size 9 /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n' % (prev, x)
+        _write(f, data)
+        return data
+
+    def test_text_that_shows_trailer_is_not_the_trailer(self):
+        """!
+        @brief Test: "trailer <<" inside a content stream does not mark the file as encrypted,
+        with exact offsets and after an edit that shifts them.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, b'BT /F1 12 Tf 72 700 Td (trailer << /Encrypt 99 0 R >>) Tj ET\n')
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('/Encrypt 99', text)
+        _write(f, self.shifted(_readb(f)))  # offsets now drift: scan
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('/Encrypt 99', text)
+
+    def test_incremental_update_newest_revision_wins(self):
+        """!
+        @brief Test: an update with /Prev replaces the content stream and frees object 6.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, objs=[b'(old six)'])
+        P.PROBLEMS.clear()
+        new = stream(b'BT /F1 12 Tf 72 700 Td (New text) Tj ET')
+        data = self.update(f, [(4, new)], [(4, 'n', 0), (6, 'f', 1)])
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('New text', text)
+        self.assertNotIn('Hello', text)
+        doc = P.Document(data)
+        self.assertIsNone(doc.resolve(P.Ref(6, 0)))
+        self.assertEqual(P.PROBLEMS, {})
+
+    def test_xref_stream_update_with_object_stream(self):
+        """!
+        @brief Test: an update made of a compressed cross-reference stream whose entries
+        point to a new content stream, a free entry and an object in an object stream.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, objs=[b'(old six)'])
+        data = _readb(f)
+        prev = int(data[data.rfind(b'startxref') + 9 :].split()[0])
+        off4 = len(data)
+        data += b'4 0 obj\n' + stream(b'BT /F1 12 Tf 72 700 Td (Streamed) Tj ET') + b'\nendobj\n'
+        packed = b'9 0 (in objstm)'
+        off7 = len(data)
+        data += b'7 0 obj\n' + stream(packed, b'/Type /ObjStm /N 1 /First 4') + b'\nendobj\n'
+        off8 = len(data)
+        rows = [(1, off4, 0), (0, 0, 1), (1, off7, 0), (1, off8, 0), (2, 7, 0)]
+        raw = zlib.compress(
+            b''.join(bytes([a]) + b.to_bytes(4, 'big') + c.to_bytes(2, 'big') for a, b, c in rows)
+        )
+        data += b'8 0 obj\n' + stream(
+            raw,
+            b'/Type /XRef /W [1 4 2] /Index [4 1 6 4] /Size 10 /Root 1 0 R '
+            b'/Filter /FlateDecode /Prev %d' % prev,
+        )
+        data += b'\nendobj\nstartxref\n%d\n%%%%EOF\n' % off8
+        _write(f, data)
+        doc = P.Document(data)
+        self.assertEqual(doc.resolve(P.Ref(9, 0)), b'in objstm')
+        self.assertIsNone(doc.resolve(P.Ref(6, 0)))
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('Streamed', text)
+
+    def test_wrong_generation_resolves_to_null(self):
+        """!
+        @brief Test: a reference whose generation number differs resolves to None, with
+        the cross-reference table and with the scan.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        for data in (_readb(f), self.shifted(_readb(f))):
+            doc = P.Document(data)
+            self.assertIsNone(doc.resolve(P.Ref(5, 1)))
+            self.assertEqual(doc.resolve(P.Ref(5, 0))['BaseFont'], 'Helvetica')
+        _write(f, _readb(f).replace(b'/Contents 4 0 R', b'/Contents 4 1 R'))
+        rc, text = self.md(f)
+        self.assertNotIn('Hello', text)
+
+    def test_scan_fallback_is_recorded_only_when_needed(self):
+        """!
+        @brief Test: shifted offsets with a readable table are not a problem; a missing
+        table, or a free object that the scan still finds, is recorded once.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        good = _readb(f)
+        _write(f, self.shifted(good))
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual((rc, err), (0, ''))
+        _write(f, good[: good.index(b'xref')] + good[good.index(b'trailer') :])
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        msg = 'malformed: cross-reference table unreadable; objects recovered by scanning'
+        self.assertEqual(err.count(msg), 1)
+        self.assertIn('Hello world', _read(self.path('o.md')))
+        make_pdf(f, objs=[b'(old six)'])
+        data = self.update(f, [(4, stream(HELLO))], [(4, 'n', 0), (6, 'f', 1)])
+        _write(f, self.shifted(data))
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn(msg, err)
+
+    def test_decoded_size_is_capped_after_every_stage(self):
+        """!
+        @brief Test: FlateDecode then ASCII85Decode stays within MAX_DECODED, and the
+        expanding decoders stop at the limit.
+        """
+        old = P.MAX_DECODED
+        P.MAX_DECODED = 1 << 16
+        try:
+            P.PROBLEMS.clear()
+            doc = P.Document(b'%PDF-1.4\n')
+            P.PROBLEMS.clear()
+            s = P.Stream({'Filter': ['FlateDecode', 'ASCII85Decode']}, zlib.compress(b'z' * 70000))
+            s.num, s.gen = 7, 0
+            t = time.time()
+            self.assertEqual(len(doc.decoded(s)), 1 << 16)
+            self.assertEqual(
+                list(P.PROBLEMS),
+                [(None, 'limit', 'stream 7 0 R: decoded size reached MAX_DECODED (65536 bytes)')],
+            )
+            self.assertEqual(len(P._a85(b'z' * 40000)), 1 << 16)
+            self.assertEqual(P._a85(b'87cURD]i,"Ebo80~>'), b'Hello World!')
+            self.assertEqual(len(P._rld(b'\x81a' * 1000)), 1 << 16)
+            parms = {'Predictor': 12, 'Columns': 1000}
+            self.assertEqual(len(P._predict(b'\0' * 300000, parms)), 1 << 16)
+            self.assertLess(time.time() - t, 5)
+        finally:
+            P.MAX_DECODED = old
+
+    def test_decode_errors_are_recorded(self):
+        """!
+        @brief Test: an unsupported filter and damaged ASCII85 data are recorded with
+        the stream's object number instead of being dropped silently.
+        """
+        f = self.path('a.pdf')
+        form = b'/Type /XObject /Subtype /Form /BBox [0 0 612 792] '
+        make_pdf(
+            f,
+            HELLO + b'/X1 Do /X2 Do',
+            [stream(b'xx', form + b'/Filter /Foo'), stream(b'\x7f\x7f', form + b'/Filter /A85')],
+            resources=b'/XObject << /X1 6 0 R /X2 7 0 R >>',
+        )
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('unsupported: stream 6 0 R: unsupported filter Foo', err)
+        self.assertIn('malformed: stream 7 0 R:', err)
+
+    def test_decoded_cache_has_a_document_budget(self):
+        """!
+        @brief Test: past MAX_DOC_DECODED, streams are still decoded but not cached.
+        """
+        old = P.MAX_DOC_DECODED
+        P.MAX_DOC_DECODED = 1000
+        try:
+            doc = P.Document(b'%PDF-1.4\n')
+            a = P.Stream({}, b'a' * 800)
+            b = P.Stream({}, b'b' * 800)
+            self.assertEqual(doc.decoded(a), b'a' * 800)
+            self.assertEqual(doc.decoded(b), b'b' * 800)
+            self.assertEqual(doc.decoded(b), b'b' * 800)
+            self.assertEqual(doc._dec_size, 800)
+            self.assertEqual(len(doc._dec), 1)
+        finally:
+            P.MAX_DOC_DECODED = old
+
+    def test_lzw_dictionary_stops_at_4096_entries(self):
+        """!
+        @brief Test: after the dictionary is full, repeated codes add no entries.
+
+        The codes build a chain of entries up to code 4095 and then
+        repeat code 4095 (3839 bytes). A growing dictionary would keep a copy of every repeat.
+        """
+        codes = [65] + list(range(258, 4096)) + [4095] * 3000
+        bits, acc, nb, data, size = 9, 0, 0, bytearray(), 258
+        for i, c in enumerate(codes):
+            acc = (acc << bits) | c
+            nb += bits
+            while nb >= 8:
+                nb -= 8
+                data.append((acc >> nb) & 0xFF)
+            acc &= (1 << nb) - 1
+            if i and size < 4096:
+                size += 1
+            if size + 1 >= (1 << bits) and bits < 12:
+                bits += 1
+        data.append((acc << (8 - nb)) & 0xFF)
+        t = time.time()
+        tracemalloc.start()
+        try:
+            out = P._lzw(bytes(data), None)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(out, b'A' * (3839 * 3840 // 2 + 3000 * 3839))
+        self.assertLess(peak - 2 * len(out), 12 << 20)  # the full dictionary is 7.4 MB
+        self.assertLess(time.time() - t, 5)
+
+
 class Layout(Base):
     """!
     @brief Degenerate geometry and image data.
@@ -464,6 +710,99 @@ class Layout(Base):
         """
         self.assertEqual(P._xml('a￾b￿c\x01d'), 'abcd')
         ET.fromstring('<t>%s</t>' % P._xml('x￿<&>'))
+
+
+class Fonts(Base):
+    """!
+    @brief Font decoding: predefined CMap code spaces and font table limits.
+    """
+
+    def type0_pdf(self, content, enc, cmap):
+        """!
+        @brief Write a PDF whose font F2 (object 6) is a Type0 font with a ToUnicode CMap.
+        @param content page content stream
+        @param enc Encoding value, e.g. b'/90ms-RKSJ-H'
+        @param cmap ToUnicode CMap data (object 7)
+        @return path of the PDF
+        """
+        f = self.path('a.pdf')
+        make_pdf(
+            f,
+            content,
+            [
+                b'<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding ' + enc + b' '
+                b'/DescendantFonts [8 0 R] /ToUnicode 7 0 R >>',
+                stream(cmap),
+                b'<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>',
+            ],
+        )
+        data = _readb(f).replace(b'/Font << /F1 5 0 R >>', b'/Font << /F1 5 0 R /F2 6 0 R >>')
+        _write(f, data)
+        return f
+
+    def test_rksj_encoding_reads_one_byte_codes(self):
+        """!
+        @brief Test: a Shift-JIS (RKSJ) predefined CMap reads ASCII bytes as one-byte codes.
+        """
+        cmap = (
+            b'begincmap 1 begincodespacerange <00> <FF> endcodespacerange '
+            b'2 beginbfchar <41> <0041> <42> <0042> endbfchar endcmap'
+        )
+        f = self.type0_pdf(b'BT /F2 12 Tf 72 700 Td (AB) Tj ET', b'/90ms-RKSJ-H', cmap)
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.strip(), 'AB')
+
+    def test_unknown_named_encoding_is_reported(self):
+        """!
+        @brief Test: an unknown predefined CMap name is read as two-byte codes and reported.
+        """
+        cmap = b'begincmap 1 beginbfchar <4142> <0058> endbfchar endcmap'
+        f = self.type0_pdf(b'BT /F2 12 Tf 72 700 Td (AB) Tj ET', b'/Foo-Bar-H', cmap)
+        rc, out, err = self.cli('-q', f, '-o', self.path('out.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('font X: encoding Foo-Bar-H parsed as two-byte codes', err)
+        self.assertEqual(_read(self.path('out.md')).strip(), 'X')
+
+    def test_hostile_tounicode_is_bounded(self):
+        """!
+        @brief Test: 300 bfranges with 1000-character destinations store bounded text.
+        """
+        dst = b'<' + b'0041' * 1000 + b'>'
+        ranges = b''.join(
+            b'<%04X> <%04X> ' % (i * 256, i * 256 + 255) + dst + b'\n' for i in range(300)
+        )
+        cmap = b'begincmap 300 beginbfrange\n' + ranges + b'endbfrange endcmap'
+        f = self.type0_pdf(b'BT /F2 12 Tf 72 700 Td <0000> Tj ET', b'/Identity-H', cmap)
+        t = time.time()
+        P.PROBLEMS.clear()
+        font = P.Font(P.Document(_readb(f)), P.Ref(6, 0))
+        self.assertLess(time.time() - t, 5)
+        stored = sum(len(v) for v in font.tounicode.values())
+        self.assertLessEqual(stored, P.MAX_FONT_TEXT)
+        self.assertLessEqual(max(len(v) for v in font.tounicode.values()), P.MAX_CMAP_DEST)
+        self.assertIn((None, 'limit', 'font X: MAX_FONT_TEXT limit reached'), P.PROBLEMS)
+        P.PROBLEMS.clear()
+        t = time.time()
+        rc, out, err = self.cli('-q', f, '-o', self.path('out.md'))
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(rc, 3)
+        self.assertIn('MAX_FONT_TEXT limit reached', err)
+
+    def test_long_string_codes_are_bounded(self):
+        """!
+        @brief Test: codes() stops after MAX_SHOW_CODES codes of one string operand.
+        """
+        P.PROBLEMS.clear()
+        font = P.Font(P.Document(b'%PDF-1.4\n'), {'Subtype': P.Name('Type1')})
+        t = time.time()
+        n = sum(1 for _ in font.codes(b'a' * (P.MAX_SHOW_CODES + 1000)))
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(n, P.MAX_SHOW_CODES)
+        self.assertTrue(any('MAX_SHOW_CODES' in k[2] for k in P.PROBLEMS))
+        P.PROBLEMS.clear()
+        self.assertEqual(len(list(font.codes(b'abc'))), 3)
+        self.assertEqual(P.PROBLEMS, {})
 
 
 class Markdown(Base):
@@ -570,6 +909,183 @@ class Markdown(Base):
         """
         self.assertEqual(P._esc('__init__'), '\\_\\_init\\_\\_')
         self.assertEqual(P._esc('snake_case'), 'snake_case')
+
+
+class LayoutLimits(Base):
+    """!
+    @brief Clustering cost, repeated-figure removal, content errors and the character cap.
+    """
+
+    def pages(self, path, pages):
+        """!
+        @brief Write a PDF with one US Letter page per entry, each with font F1 (object 3).
+        @param path output file
+        @param pages list of (content stream, image pixel bytes or None); an image is a
+               10 x 1 RGB image named Im in the page resources
+        """
+        font = b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+        body = [b'<< /Type /Catalog /Pages 2 0 R >>', None, font]
+        kids = []
+        for content, img in pages:
+            n = len(body) + 1
+            kids.append(b'%d 0 R' % n)
+            res = b'/Font << /F1 3 0 R >>'
+            if img is not None:
+                res += b' /XObject << /Im %d 0 R >>' % (n + 2)
+            body.append(
+                b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents %d 0 R '
+                b'/Resources << %s >> >>' % (n + 1, res)
+            )
+            body.append(stream(content))
+            if img is not None:
+                body.append(
+                    stream(
+                        img,
+                        b'/Type /XObject /Subtype /Image /Width 10 /Height 1 '
+                        b'/ColorSpace /DeviceRGB /BitsPerComponent 8',
+                    )
+                )
+        body[1] = b'<< /Type /Pages /Kids [%s] /Count %d >>' % (b' '.join(kids), len(kids))
+        out = b'%PDF-1.4\n'
+        offs = []
+        for i, o in enumerate(body):
+            offs.append(len(out))
+            out += b'%d 0 obj\n' % (i + 1) + o + b'\nendobj\n'
+        x = len(out)
+        out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(body) + 1)
+        out += b''.join(b'%010d 00000 n \n' % o for o in offs)
+        out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(body) + 1, x)
+        _write(path, out)
+
+    def test_huge_page_with_long_diagonal_path_is_fast(self):
+        """!
+        @brief Test: a diagonal path across a 10^9 point page does not fill the cluster grid.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'0 0 m 500000000 500000000 l S', media=b'0 0 1000000000 1000000000')
+        t = time.time()
+        rc, _ = self.md(f, timeout=60)
+        self.assertEqual(rc, 0)
+        self.assertLess(time.time() - t, 5)
+
+    def test_different_full_page_scans_are_kept(self):
+        """!
+        @brief Test: three pages with different full-page images keep all three images.
+        """
+        f = self.path('a.pdf')
+        scan = b'q 612 0 0 792 0 0 cm /Im Do Q'
+        self.pages(f, [(scan, c * 10) for c in (b'\xff\0\0', b'\0\xff\0', b'\0\0\xff')])
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.count('!['), 3)
+
+    def test_repeated_logo_in_header_band_is_dropped(self):
+        """!
+        @brief Test: the same small image in the top band of 4 of 4 pages is dropped.
+        """
+        f = self.path('a.pdf')
+        self.pages(
+            f,
+            [
+                (
+                    b'q 50 0 0 50 72 720 cm /Im Do Q BT /F1 12 Tf 72 400 Td (Body %d) Tj ET' % k,
+                    b'\x80\x40\x20' * 10,
+                )
+                for k in range(4)
+            ],
+        )
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertNotIn('![', text)
+        self.assertIn('Body 3', text)
+
+    def test_repeated_figure_mid_page_is_kept(self):
+        """!
+        @brief Test: the same small image in the middle of 4 pages stays on every page.
+        """
+        f = self.path('a.pdf')
+        self.pages(
+            f,
+            [
+                (
+                    b'q 50 0 0 50 72 400 cm /Im Do Q BT /F1 12 Tf 72 300 Td (Body %d) Tj ET' % k,
+                    b'\x80\x40\x20' * 10,
+                )
+                for k in range(4)
+            ],
+        )
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.count('!['), 4)
+
+    def test_failing_operator_and_annotation_are_reported(self):
+        """!
+        @brief Test: an operator without operands and a non-numeric annotation Rect are
+        reported on stderr with exit code 3; the rest of the page is kept.
+        """
+        f = self.path('a.pdf')
+        make_pdf(
+            f,
+            b'Tf ' + HELLO,
+            [
+                b'<< /Type /Annot /Subtype /FreeText /Rect [(a) 0 100 100] /AP << /N 7 0 R >> >>',
+                stream(b'BT /F1 9 Tf 0 0 Td (x) Tj ET', b'/Type /XObject /Subtype /Form'),
+            ],
+            page=b'/Annots [6 0 R]',
+        )
+        rc, out, err = self.cli(f, '-o', self.path('out.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('page 1: internal: content operator Tf: IndexError', err)
+        self.assertIn('page 1: malformed: annotation 6 0 R: Rect, BBox or Matrix', err)
+        self.assertIn('Hello world', _read(self.path('out.md')))
+
+    def test_page_characters_are_capped(self):
+        """!
+        @brief Test: one Tj of 3 MB collects at most MAX_PAGE_CHARS characters and records
+        a limit problem.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, b'BT /F1 12 Tf 72 700 Td (' + b'a' * 3000000 + b') Tj ET')
+        old = P.MAX_PAGE_CHARS
+        P.MAX_PAGE_CHARS = 1000
+        try:
+            t = time.time()
+            _, _, layouts = P.analyze(f)
+            elapsed = time.time() - t
+            problems = list(P.PROBLEMS)
+        finally:
+            P.MAX_PAGE_CHARS = old
+        self.assertLessEqual(sum(len(l.chars) for l in layouts[0].lines), 1000)
+        self.assertIn((1, 'limit', 'page reached MAX_PAGE_CHARS (1000 characters)'), problems)
+        self.assertLess(elapsed, 5)
+
+
+class InlineImages(Base):
+    """!
+    @brief Inline images are skipped and reported.
+    """
+
+    def test_inline_image_is_reported(self):
+        """!
+        @brief Test: an inline image exits 3 with an unsupported problem; the text stays.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'q 10 0 0 10 72 600 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q\n')
+        rc, out, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('page 1: unsupported: 1 inline image(s) (BI/ID/EI) not exported', err)
+        self.assertIn('Hello world', _read(self.path('o.md')))
+        rc, _, err = self.cli('-q', '--no-figures', f, '-o', self.path('o.md'))
+        self.assertEqual((rc, err), (0, ''))
+
+    def test_tiny_inline_image_is_not_reported(self):
+        """!
+        @brief Test: an inline image placed under 1 point is ignored like a tiny XObject.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'q 0.5 0 0 0.5 72 600 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q\n')
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual((rc, err), (0, ''))
 
 
 class CommandLine(Base):
@@ -763,6 +1279,228 @@ class CommandLine(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
+def _png_pixels(png):
+    """!
+    @brief Decode a PNG written by pdf2md (filter type 0 on every row).
+    @param png PNG file bytes
+    @return (width, height, color type, bit depth, row bytes without filter bytes)
+    """
+    w = int.from_bytes(png[16:20], 'big')
+    h = int.from_bytes(png[20:24], 'big')
+    depth, ctype = png[24], png[25]
+    idat = b''
+    i = 8
+    while i < len(png):
+        n = int.from_bytes(png[i : i + 4], 'big')
+        if png[i + 4 : i + 8] == b'IDAT':
+            idat += png[i + 8 : i + 8 + n]
+        i += 12 + n
+    raw = zlib.decompress(idat)
+    rowlen = len(raw) // h
+    rows = b''.join(raw[r * rowlen + 1 : (r + 1) * rowlen] for r in range(h))
+    return w, h, ctype, depth, rows
+
+
+class Images(Base):
+    """!
+    @brief Image export: placement transform, /Decode, limits and problem reports.
+    """
+
+    ## 2 x 2 DeviceRGB image object: red, green, blue, white
+    RGB = stream(
+        b'\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\xff',
+        b'/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB '
+        b'/BitsPerComponent 8',
+    )
+
+    def export(self, content, obj=None, page=b''):
+        """!
+        @brief Convert a page that draws image Im1 (object 6) and read the asset files.
+        @param content page content stream
+        @param obj image object, default RGB
+        @param page extra entries for the page dictionary
+        @return (exit code, stderr, {file name: bytes} of the asset files)
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, content, [obj or self.RGB], resources=b'/XObject << /Im1 6 0 R >>', page=page)
+        rc, _, err = self.cli(f, '-o', self.path('out.md'))
+        files = {}
+        adir = self.path('out_assets')
+        for name in sorted(os.listdir(adir)) if os.path.isdir(adir) else []:
+            files[name] = _readb(os.path.join(adir, name))
+        return rc, err, files
+
+    def test_rotated_image_exports_svg_with_transform(self):
+        """!
+        @brief Test: an image rotated by 90 degrees is exported as SVG with its matrix.
+        """
+        rc, err, files = self.export(b'q 0 200 -200 0 300 100 cm /Im1 Do Q')
+        self.assertEqual(list(files), ['p001_img1.svg'], err)
+        svg = files['p001_img1.svg'].decode('utf-8')
+        ET.fromstring(svg)
+        self.assertIn('matrix(0 200 -200 0 300 100) matrix(1 0 0 -1 0 1)', svg)
+        self.assertIn('data:image/png;base64,', svg)
+
+    def test_mirrored_image_exports_svg_with_transform(self):
+        """!
+        @brief Test: a horizontally mirrored image is exported as SVG with its matrix.
+        """
+        rc, err, files = self.export(b'q -200 0 0 200 300 100 cm /Im1 Do Q')
+        self.assertEqual(list(files), ['p001_img1.svg'], err)
+        self.assertIn('matrix(-200 0 0 200 300 100)', files['p001_img1.svg'].decode('utf-8'))
+
+    def test_upright_image_exports_png(self):
+        """!
+        @brief Test: an axis-aligned upright image is still exported as a plain PNG.
+        """
+        rc, err, files = self.export(b'q 200 0 0 100 100 100 cm /Im1 Do Q')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(list(files), ['p001_img1.png'])
+        self.assertEqual(_png_pixels(files['p001_img1.png'])[4][:3], b'\xff\x00\x00')
+
+    def test_rotated_page_image_exports_svg(self):
+        """!
+        @brief Test: an upright image on a page with /Rotate 90 is exported rotated.
+        """
+        rc, err, files = self.export(b'q 200 0 0 100 100 100 cm /Im1 Do Q', page=b'/Rotate 90')
+        self.assertEqual(list(files), ['p001_img1.svg'], err)
+
+    def test_same_image_two_placements_two_files(self):
+        """!
+        @brief Test: one image stream drawn upright and mirrored gives two files.
+        """
+        rc, err, files = self.export(
+            b'q 100 0 0 100 50 50 cm /Im1 Do Q q -100 0 0 100 450 600 cm /Im1 Do Q'
+        )
+        self.assertEqual(sorted(f.rsplit('.', 1)[1] for f in files), ['png', 'svg'], err)
+
+    def test_rgb_decode_inverts_components(self):
+        """!
+        @brief Test: /Decode [1 0 1 0 1 0] on a DeviceRGB image inverts each component.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {
+                'Width': 1,
+                'Height': 1,
+                'BitsPerComponent': 8,
+                'ColorSpace': 'DeviceRGB',
+                'Decode': [1, 0, 1, 0, 1, 0],
+            },
+            b'\xff\x00\x00',
+        )
+        ext, png = P.image_file(doc, s, {})
+        self.assertEqual(_png_pixels(png)[4], b'\x00\xff\xff')
+
+    def test_cmyk_and_interval_decode(self):
+        """!
+        @brief Test: /Decode on CMYK and a general interval on RGB map each component.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {
+                'Width': 1,
+                'Height': 1,
+                'BitsPerComponent': 8,
+                'ColorSpace': 'DeviceCMYK',
+                'Decode': [1, 0, 0, 1, 0, 1, 0, 1],
+            },
+            b'\xff\x00\x00\x00',
+        )
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\xff\xff\xff')
+        s = P.Stream(
+            {
+                'Width': 1,
+                'Height': 1,
+                'BitsPerComponent': 8,
+                'ColorSpace': 'DeviceRGB',
+                'Decode': [0, 0.5, 0.5, 1, 0, 1],
+            },
+            b'\xff\x00\x80',
+        )
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\x80\x80\x80')
+
+    def test_indexed_decode(self):
+        """!
+        @brief Test: Indexed /Decode [N 0] reverses the index; other arrays are reported.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        cs = ['Indexed', 'DeviceGray', 1, b'\x00\xff']
+        s = P.Stream({'Width': 8, 'Height': 1, 'BitsPerComponent': 1, 'ColorSpace': cs}, b'\x0f')
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\x0f')
+        s.dict['Decode'] = [1, 0]
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\xf0')
+        s.dict['Decode'] = [0, 0.5]
+        why = []
+        self.assertIsNone(P.image_file(doc, s, {}, why))
+        self.assertEqual(why[0][0], 'unsupported')
+
+    def test_image_side_limit_for_native_formats(self):
+        """!
+        @brief Test: a JPEG wider than MAX_IMAGE_SIDE is not exported and is reported.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {'Width': P.MAX_IMAGE_SIDE + 1, 'Height': 1, 'Filter': 'DCTDecode'}, b'\xff\xd8'
+        )
+        why = []
+        self.assertIsNone(P.image_file(doc, s, {}, why))
+        self.assertEqual(why[0][0], 'limit')
+        s.dict['Width'] = 1
+        self.assertEqual(P.image_file(doc, s, {}), ('jpg', b'\xff\xd8'))
+
+    def test_large_png_is_fast(self):
+        """!
+        @brief Test: a 4096 x 4096 gray image converts within a few seconds.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {'Width': 4096, 'Height': 4096, 'BitsPerComponent': 8, 'ColorSpace': 'DeviceGray'},
+            bytes(range(256)) * 65536,
+        )
+        t = time.time()
+        ext, png = P.image_file(doc, s, {})
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(_png_pixels(png)[4][:3], b'\x00\x01\x02')
+
+    def test_unsupported_image_is_reported(self):
+        """!
+        @brief Test: a JBIG2 image gives exit code 3 and a named problem line.
+        """
+        obj = stream(
+            b'\x00' * 8,
+            b'/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray '
+            b'/BitsPerComponent 1 /Filter /JBIG2Decode',
+        )
+        rc, err, files = self.export(b'q 200 0 0 200 100 100 cm /Im1 Do Q', obj)
+        self.assertEqual(rc, 3)
+        self.assertIn('page 1: unsupported: image 6 0 R: JBIG2Decode not exported', err)
+        self.assertIn('not exported', _read(self.path('out.md')))
+
+    def test_conversion_exception_is_reported(self):
+        """!
+        @brief Test: an exception inside image_file is recorded as an internal problem.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, b'', [self.RGB])
+        doc = P.Document(_readb(f))
+        sh = P.Shape()
+        sh.stream, sh.resources = doc.objects[6], {}
+        ex = P.Exporter(doc, self.path('assets'), self.dir)
+        old = P.image_file
+        P.image_file = lambda *a: 1 / 0
+        P.PROBLEMS.clear()
+        try:
+            self.assertIsNone(ex.raster(sh))
+        finally:
+            P.image_file = old
+        self.assertEqual(
+            list(P.PROBLEMS),
+            [(None, 'internal', 'image 6 0 R: ZeroDivisionError: division by zero')],
+        )
+        P.PROBLEMS.clear()
+
+
 class Contents(Base):
     """!
     @brief Printed table of contents detection.
@@ -887,6 +1625,461 @@ class Contents(Base):
             [(b'Menu', b'x')] * 2,
         )
         self.assertEqual(self.folders(f), ['page_0001.md', 'page_0002.md', 'page_0003.md'])
+
+
+class OutputSafety(Base):
+    """!
+    @brief Output files never overwrite the input; writes are atomic; problems give exit 3.
+    """
+
+    def link(self, kind, src, dst):
+        """!
+        @brief Create a symbolic or hard link, or skip the test where that is not possible.
+        @param kind 'sym' or 'hard'
+        @param src existing file
+        @param dst link path
+        """
+        try:
+            if kind == 'sym':
+                os.symlink(src, dst)
+            else:
+                os.link(src, dst)
+        except (OSError, NotImplementedError, AttributeError) as exc:
+            self.skipTest('cannot create a %s link: %s' % (kind, exc))
+
+    def image_pdf(self):
+        """!
+        @brief Write a one-page PDF with text and a 2x2 gray image.
+        @return path of the PDF
+        """
+        f = self.path('a.pdf')
+        make_pdf(
+            f,
+            HELLO + b'q 200 0 0 200 100 100 cm /Im1 Do Q\n',
+            [
+                stream(
+                    b'\x00\xff\xff\x00',
+                    b'/Type /XObject /Subtype /Image /Width 2 /Height 2 '
+                    b'/ColorSpace /DeviceGray /BitsPerComponent 8',
+                )
+            ],
+            resources=b'/XObject << /Im1 6 0 R >>',
+        )
+        return f
+
+    def run_main(self, *args):
+        """!
+        @brief Run P.main in this process.
+        @param args command-line arguments
+        @return (exit code, stderr text)
+        """
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = P.main(list(args))
+        return rc, err.getvalue()
+
+    def test_symlink_output_to_input_is_refused(self):
+        """!
+        @brief Test: an output file that is a symbolic link to the input is refused.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        before = _readb(f)
+        out = self.path('out.md')
+        self.link('sym', f, out)
+        rc, _, err = self.cli('-q', f, '-o', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertEqual(_readb(f), before)
+
+    def test_hard_link_output_to_input_is_refused(self):
+        """!
+        @brief Test: an output file that is a hard link to the input is refused.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        before = _readb(f)
+        out = self.path('out.md')
+        self.link('hard', f, out)
+        rc, _, err = self.cli('-q', f, '-o', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertEqual(_readb(f), before)
+
+    def test_convert_refuses_alias_of_input(self):
+        """!
+        @brief Test: convert() called directly with an alias of the input raises UsageError.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        before = _readb(f)
+        out = self.path('out.md')
+        self.link('hard', f, out)
+        with self.assertRaises(P.UsageError):
+            P.convert(f, out, self.path('assets'))
+        with self.assertRaises(P.UsageError):
+            P.convert(f, os.path.join(self.path('x'), '..', 'a.pdf'), self.path('assets'))
+        self.assertEqual(_readb(f), before)
+
+    def test_split_page_and_asset_aliases_keep_input(self):
+        """!
+        @brief Test: with --split-pages, page and figure files that link to the input do
+        not change it.
+        """
+        f = self.image_pdf()
+        before = _readb(f)
+        o = self.path('o')
+        rc, _, _ = self.cli('-q', '--split-pages', f, '-o', o)
+        self.assertEqual(rc, 0)
+        assets = os.listdir(os.path.join(o, '_assets'))
+        self.assertEqual(len(assets), 1)
+        # a page file that links to the input: refused before anything is written
+        shutil.rmtree(o)
+        os.makedirs(o)
+        self.link('sym', f, os.path.join(o, 'page_0001.md'))
+        rc, _, err = self.cli('-q', '--split-pages', f, '-o', o)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertFalse(os.path.exists(os.path.join(o, 'index.md')))
+        self.assertEqual(_readb(f), before)
+        # a figure file that links to the input
+        shutil.rmtree(o)
+        os.makedirs(os.path.join(o, '_assets'))
+        self.link('sym', f, os.path.join(o, '_assets', assets[0]))
+        rc, _, err = self.cli('-q', '--split-pages', f, '-o', o)
+        self.assertEqual(rc, 1)
+        self.assertIn('refers to the input file', err)
+        self.assertEqual(_readb(f), before)
+        # index.md as a hard link to the input
+        shutil.rmtree(o)
+        os.makedirs(o)
+        self.link('hard', f, os.path.join(o, 'index.md'))
+        with self.assertRaises(P.UsageError):
+            P.convert_split(f, o)
+        self.assertEqual(_readb(f), before)
+
+    def test_failed_write_keeps_old_file(self):
+        """!
+        @brief Test: a write that fails half-way keeps the old output and leaves no
+        temporary file.
+        """
+        f = self.image_pdf()
+        out = self.path('out.md')
+        _write(out, b'old content\n')
+        real = os.fdopen
+
+        class Full:
+            """!
+            @brief File wrapper that writes half the data, then fails like a full disk.
+            """
+
+            def __init__(self, fh):
+                """!
+                @brief Wrap an open file.
+                @param fh file object
+                """
+                ## the wrapped file
+                self.fh = fh
+
+            def __enter__(self):
+                """!
+                @brief Enter the context.
+                @return self
+                """
+                return self
+
+            def __exit__(self, *exc):
+                """!
+                @brief Close the wrapped file.
+                @param exc exception information
+                """
+                self.fh.close()
+
+            def write(self, data):
+                """!
+                @brief Write half the data, then raise ENOSPC.
+                @param data bytes to write
+                """
+                self.fh.write(data[: len(data) // 2])
+                raise OSError(errno.ENOSPC, 'No space left on device')
+
+        with mock.patch.object(P.os, 'fdopen', lambda *a, **k: Full(real(*a, **k))):
+            rc, err = self.run_main('-q', f, '-o', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('No space left', err)
+        self.assertEqual(_readb(out), b'old content\n')
+        left = [n for _, _, fs in os.walk(self.path('')) for n in fs if n.endswith('.tmp')]
+        self.assertEqual(left, [])
+        # a normal run replaces the file
+        rc, err = self.run_main('-q', f, '-o', out)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('Hello world', _read(out))
+
+    def test_page_error_exits_3_with_output(self):
+        """!
+        @brief Test: a page that fails in layout gives exit 3, the Markdown file, and the
+        problem on stderr, also with -q and with --split-pages.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        out = self.path('out.md')
+
+        def boom(*a, **k):
+            """!
+            @brief Fail like a layout bug.
+            @param a ignored
+            @param k ignored
+            """
+            raise ValueError('broken layout')
+
+        with mock.patch.object(P, 'layout_page', boom):
+            rc, err = self.run_main('-q', f, '-o', out)
+            self.assertEqual(rc, 3)
+            self.assertTrue(os.path.exists(out))
+            self.assertIn('page 1:', err)
+            self.assertIn('broken layout', err)
+            rc, err = self.run_main('-q', '--split-pages', f, '-o', self.path('o'))
+            self.assertEqual(rc, 3)
+            self.assertTrue(os.path.exists(self.path('o/index.md')))
+            self.assertIn('page 1:', err)
+        # the next run starts with no problems
+        rc, err = self.run_main('-q', f, '-o', out)
+        self.assertEqual((rc, err), (0, ''))
+
+    def test_failure_after_partial_output_exits_2(self):
+        """!
+        @brief Test: an exception after some files were written exits with code 2.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        real = P._write_atomic
+
+        def fail_index(path, data):
+            """!
+            @brief Write page files, fail on index.md.
+            @param path target path
+            @param data file contents
+            """
+            if path.endswith('index.md'):
+                raise RuntimeError('index failed')
+            real(path, data)
+
+        with mock.patch.object(P, '_write_atomic', fail_index):
+            rc, err = self.run_main('-q', '--split-pages', f, '-o', self.path('o'))
+        self.assertEqual(rc, 2)
+        self.assertIn('index failed', err)
+        self.assertTrue(os.path.exists(self.path('o/page_0001.md')))
+
+    def test_clean_file_exits_0_silently(self):
+        """!
+        @brief Test: a clean file exits 0 with empty stderr under -q.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        rc, _, err = self.cli('-q', f, '-o', self.path('out.md'))
+        self.assertEqual((rc, err), (0, ''))
+        rc, _, err = self.cli('-q', '--split-pages', f, '-o', self.path('o'))
+        self.assertEqual((rc, err), (0, ''))
+
+
+class ReviewRegressions(Base):
+    """!
+    @brief Cases from the review of the merged fixes: hybrid files, cross-reference
+    stream size, numbered band figures, per-page code count, large boxes, ISO-2022 CMaps.
+    """
+
+    def pages_pdf(self, contents, media=b'0 0 612 792'):
+        """!
+        @brief Write a PDF with one page per content stream and a Helvetica font F1.
+        @param contents list of content stream bytes
+        @param media MediaBox numbers
+        @return path of the PDF
+        """
+        n = len(contents)
+        kids = b' '.join(b'%d 0 R' % (3 + 2 * i) for i in range(n))
+        objs = [
+            b'<< /Type /Catalog /Pages 2 0 R >>',
+            b'<< /Type /Pages /Kids [' + kids + b'] /Count %d >>' % n,
+        ]
+        for i, c in enumerate(contents):
+            objs.append(
+                b'<< /Type /Page /Parent 2 0 R /MediaBox [' + media + b'] /Contents %d 0 R '
+                b'/Resources << /Font << /F1 %d 0 R >> >> >>' % (4 + 2 * i, 3 + 2 * n)
+            )
+            objs.append(stream(c))
+        objs.append(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+        out = b'%PDF-1.4\n'
+        offs = []
+        for i, o in enumerate(objs):
+            offs.append(len(out))
+            out += b'%d 0 obj\n' % (i + 1) + o + b'\nendobj\n'
+        x = len(out)
+        out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(objs) + 1)
+        out += b''.join(b'%010d 00000 n \n' % o for o in offs)
+        out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (
+            len(objs) + 1,
+            x,
+        )
+        f = self.path('pages.pdf')
+        _write(f, out)
+        return f
+
+    def test_hybrid_table_marking_compressed_objects_free(self):
+        """!
+        @brief Test: an /XRefStm entry replaces a free entry of the same section's table.
+        """
+        out = b'%PDF-1.5\n'
+        offs = {}
+
+        def obj(n, body):
+            offs[n] = len(out)
+            return out + b'%d 0 obj\n' % n + body + b'\nendobj\n'
+
+        content = b'BT /F1 12 Tf 72 700 Td (Hello hybrid) Tj ET'
+        out = obj(1, b'<< /Type /Catalog /Pages 2 0 R >>')
+        out = obj(2, b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>')
+        out = obj(4, stream(content))
+        o3 = (
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R '
+            b'/Resources << /Font << /F1 5 0 R >> >> >>'
+        )
+        o5 = b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+        head = b'3 0 5 %d ' % (len(o3) + 1)
+        out = obj(6, stream(head + o3 + b' ' + o5, b'/Type /ObjStm /N 2 /First %d' % len(head)))
+        rows = b''
+        for n in range(7):
+            if n in (3, 5):
+                rows += struct.pack('>BIH', 2, 6, 0 if n == 3 else 1)
+            elif n in offs:
+                rows += struct.pack('>BIH', 1, offs[n], 0)
+            else:
+                rows += struct.pack('>BIH', 0, 0, 65535)
+        xs = len(out)
+        rows += struct.pack('>BIH', 1, xs, 0)
+        out = obj(7, stream(rows, b'/Type /XRef /W [1 4 2] /Size 8'))
+        x = len(out)
+        out += b'xref\n0 8\n0000000003 65535 f \n'
+        for n in range(1, 8):
+            if n in (3, 5):
+                out += b'%010d 65535 f \n' % (5 if n == 3 else 0)
+            else:
+                out += b'%010d 00000 n \n' % offs[n]
+        out += b'trailer\n<< /Size 8 /Root 1 0 R /XRefStm %d >>\nstartxref\n%d\n%%%%EOF\n' % (
+            xs,
+            x,
+        )
+        f = self.path('h.pdf')
+        _write(f, out)
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('Hello hybrid', text)
+
+    def test_cross_reference_stream_entries_are_bounded(self):
+        """!
+        @brief Test: a cross-reference stream of 16 MiB compressed zeros is read quickly.
+        """
+        comp = zlib.compress(b'\0' * (16 << 20), 9)
+        body = [
+            b'<< /Type /Catalog /Pages 2 0 R >>',
+            b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R '
+            b'/Resources << /Font << /F1 5 0 R >> >> >>',
+            stream(HELLO),
+            b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        ]
+        out = b'%PDF-1.5\n'
+        for i, o in enumerate(body):
+            out += b'%d 0 obj\n' % (i + 1) + o + b'\nendobj\n'
+        x = len(out)
+        out += b'6 0 obj\n' + stream(
+            comp, b'/Type /XRef /W [0 1 0] /Size %d /Root 1 0 R /Filter /FlateDecode' % (16 << 20)
+        )
+        out += b'\nendobj\nstartxref\n%d\n%%%%EOF\n' % x
+        f = self.path('x.pdf')
+        _write(f, out)
+        t = time.time()
+        rc, text = self.md(f)
+        self.assertIn(rc, (0, 3))
+        self.assertIn('Hello world', text)
+        self.assertLess(time.time() - t, 5)
+
+    def test_band_figure_with_page_number_is_dropped(self):
+        """!
+        @brief Test: a footer badge whose text is the page number repeats on every page.
+        """
+        pages = []
+        for n in range(1, 7):
+            body = b''.join(
+                b'BT /F1 11 Tf 72 %d Td (Body line %d on page %d) Tj ET\n' % (700 - 14 * i, i, n)
+                for i in range(20)
+            )
+            # filled circle of radius 14 pt at (306, 40), drawn with four Bezier curves
+            badge = b'0.2 0.3 0.8 rg 320 40 m 320 47.7 313.7 54 306 54 c 298.3 54 292 47.7 '
+            badge += b'292 40 c 292 32.3 298.3 26 306 26 c 313.7 26 320 32.3 320 40 c f '
+            badge += b'1 g BT /F1 9 Tf 303 37 Td (%d) Tj ET 0 g\n' % n
+            pages.append(body + badge)
+        rc, text = self.md(self.pages_pdf(pages))
+        self.assertEqual(rc, 0)
+        self.assertIn('Body line 3 on page 6', text)
+        self.assertNotIn('![', text)
+
+    def test_codes_without_characters_count_per_page(self):
+        """!
+        @brief Test: codes that produce no Char (size under 1 pt) count toward MAX_PAGE_CODES.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'BT /F1 0.1 Tf 72 600 Td (' + b'x' * 5000 + b') Tj ET\n')
+        old = P.MAX_PAGE_CODES
+        P.MAX_PAGE_CODES = 1000
+        try:
+            P.analyze(f)
+        finally:
+            P.MAX_PAGE_CODES = old
+        self.assertIn((1, 'limit', 'page reached MAX_PAGE_CODES (1000 codes)'), list(P.PROBLEMS))
+
+    def test_many_large_boxes_are_fast(self):
+        """!
+        @brief Test: 8000 lines of 100,000 pt each on a wide page cluster in under 5 s.
+        """
+        c = b''.join(b'%d 0 m %d 100000 l S\n' % (i * 100, i * 100) for i in range(8000))
+        f = self.pages_pdf([HELLO + c], media=b'0 0 10000000 100000')
+        t = time.time()
+        rc, _ = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertLess(time.time() - t, 5)
+
+    def test_boxes_beyond_all_grid_levels_are_fast(self):
+        """!
+        @brief Test: 8000 lines of 2e300 pt on a page of that size cluster in under 5 s.
+        """
+        big = b'1' + b'0' * 300
+        c = b''.join(b'%d0 0 m %d0 2' % (i, i) + big + b' l S\n' for i in range(1, 8001))
+        f = self.pages_pdf([HELLO + c], media=b'0 0 3' + big + b' 3' + big)
+        t = time.time()
+        rc, _ = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertLess(time.time() - t, 5)
+
+    def test_iso2022_cmaps_are_two_byte(self):
+        """!
+        @brief Test: /78-H, /GBT-H and /KSC-Johab-H have a known code space, no problem.
+        """
+        for name in (b'78-H', b'GBT-H', b'KSC-Johab-H'):
+            f = self.path('a.pdf')
+            make_pdf(
+                f,
+                b'BT /F2 12 Tf 72 700 Td <0041> Tj ET ' + HELLO,
+                [
+                    b'<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /'
+                    + name
+                    + b' /DescendantFonts [7 0 R] >>',
+                    b'<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>',
+                ],
+            )
+            data = _readb(f).replace(b'/Font << /F1 5 0 R >>', b'/Font << /F1 5 0 R /F2 6 0 R >>')
+            _write(f, data)
+            rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+            self.assertEqual((rc, err), (0, ''), name)
 
 
 if __name__ == '__main__':
