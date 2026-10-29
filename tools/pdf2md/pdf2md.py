@@ -5179,8 +5179,8 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
 
     Page headers and footers are removed from the layouts (see _drop_repeats). A page
     whose content fails to process is recorded with problem() and kept as an empty
-    layout. When /Rotate is set but less than half the text reads upright, the unrotated view is used if it
-    has more upright characters.
+    layout. When /Rotate is set but less than half the text reads upright, the
+    unrotated view is used if it has more upright characters.
 
     @param pdf_path Path of the PDF file.
     @param pages PageSelection (or set) of 1-based page numbers to process; None for all.
