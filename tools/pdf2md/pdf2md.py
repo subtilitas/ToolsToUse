@@ -26,16 +26,35 @@ python pdf2md.py input.pdf --split-pages --flat  # page files without folders
   and Arabic presentation forms are replaced by their base characters
   (Unicode normalization form NFKC).
 - Vector graphics (ruled tables, diagrams, charts) become SVG files that also
-  contain the text inside their area. Raster images become PNG, JPEG or
-  JPEG 2000 files. Each figure is linked from the Markdown at its position in
-  reading order. Frames and fills that span a whole text box (boxed notes,
-  form fields) stay text.
+  contain the text inside their area. Each figure is linked from the Markdown
+  at its position in reading order. Frames and fills that span a whole text box
+  (boxed notes, form fields) stay text.
+- A figure that is a single raster image placed upright (positive x and y
+  scale, no shear) is written as PNG, JPEG or JPEG 2000. An image that is
+  rotated, mirrored or sheared, also by the page /Rotate, is written as an SVG
+  that embeds the PNG or JPEG data and applies the placement matrix. A JPEG 2000
+  image is always written as its own file; a rotation, mirroring or shear of it
+  is reported as a problem. Image /Decode arrays are applied per component; a
+  16-bit RGB image with a /Decode other than [0 1] or [1 0] per component is
+  written with 8 bits per component.
 - Text of visible annotation appearances (filled-in form fields, free text,
   stamps) is included. Their borders and backgrounds are not.
 - Pages with /Rotate are read as displayed. When most text on a rotated page
   is not upright as displayed, the page is read unrotated.
-- Lines and figures that repeat at the same place on at least 50 % of the
-  pages (minimum 3 pages) are treated as page headers or footers and dropped.
+- Lines in the top or bottom 10 % of the page box that repeat (digits ignored)
+  on at least 50 % of the pages, minimum 3 pages, are page headers or footers
+  and are dropped. A figure is dropped only when it lies wholly inside one of
+  these bands and the same figure (same rounded position, same shapes and image
+  data, same text) occurs there on that many pages. Figures elsewhere,
+  including full-page scans, are kept.
+- Objects are read through the cross-reference chain from the last startxref
+  (tables, cross-reference streams, /XRefStm, /Prev). The newest revision wins,
+  free entries are ignored, and a reference with a different generation number
+  is null. When the chain is unreadable, objects are recovered by scanning the
+  file; this is reported as a problem unless only the byte offsets have shifted.
+- Output files are written to a temporary file in the same directory and moved
+  into place with os.replace(). A failed run keeps an existing file unchanged,
+  and a symbolic link at an output path is replaced, not written through.
 
 @par One file per page (--split-pages)
 - Each page becomes page_NNNN.md. index.md lists the contents with links.
@@ -56,22 +75,46 @@ Python 3.8 or later. No third-party packages. No network access.
 @par Exit codes
 - 0: success.
 - 1: usage error (unknown option, invalid --pages, no selected page in the
-  document, output path equal to the input) or a file system error.
+  document, an output path that is the input file or a symbolic or hard link to
+  it) or a file system error. Markdown, page and index.md paths are checked
+  before any file is written; figure paths when they are written.
 - 2: the file cannot be parsed or is encrypted, or the conversion failed
   (reported in one line, without a traceback).
 - 3: the output was written but is incomplete. Each problem is printed on stderr
   as one line with page number, kind and cause, also with -q (see problem()).
+  Kinds: unsupported (feature not handled), malformed (damaged input), limit
+  (a resource limit cut the output), internal (unexpected exception). Causes
+  include a failing content operator, Form XObject, font or annotation, a
+  stream that cannot be decoded, an image that is not exported, and every limit
+  below. Identical problems are listed once with a repeat count; at most
+  MAX_PROBLEMS = 1000 distinct problems are listed.
 
 @par Resource limits
 Hostile or damaged files are bounded by these limits; output of a file that
 hits one is incomplete.
-- One decoded stream: MAX_DECODED = 256 MiB. Peak memory for such a stream is
-  about twice that.
-- Images: at most MAX_IMAGE_PIXELS = 2^26 pixels, and a declared size of at most
-  twice the stored data plus 64 KiB; others are not exported.
-- One page: MAX_PAGE_OPS = 5,000,000 content stream operators and
-  MAX_FORM_RUNS = 2000 Form XObject runs.
-- One font: MAX_FONT_ENTRIES = 2^20 code, width and glyph table entries.
+- One decoded stream: MAX_DECODED = 256 MiB, checked after every filter stage
+  and inside the Flate, LZW, ASCII85, ASCIIHex, RunLength and predictor
+  decoders. Peak memory for such a stream is about twice that.
+- Decoded-stream cache: MAX_DOC_DECODED = 1 GiB per document. Streams decoded
+  after that are not cached and are decoded again on each use.
+- LZW dictionary: MAX_LZW_TABLE = 4096 entries; a full dictionary stops growing
+  until a clear code.
+- Images: at most MAX_IMAGE_SIDE = 65,536 pixels per side and
+  MAX_IMAGE_PIXELS = 2^26 pixels, checked on the declared /Width and /Height
+  before decoding, also for JPEG and JPEG 2000, and a declared size of at most
+  twice the stored data plus 64 KiB; others are not exported. The Lab color
+  cache holds at most MAX_LAB_MEMO = 65,536 entries per image.
+- One page: MAX_PAGE_OPS = 5,000,000 content stream operators,
+  MAX_FORM_RUNS = 2000 Form XObject runs, Form XObjects nested at most 12
+  levels deep, and MAX_PAGE_CHARS = 1,000,000 characters.
+- Figure clustering: a box that would occupy more than MAX_GRID_CELLS = 1024
+  grid cells (cells of at least 64 x 64 pt) is compared with all other boxes
+  directly instead of through the grid.
+- One font: MAX_FONT_ENTRIES = 2^20 entries in each table (ToUnicode and
+  encoding CMap codes, W and Widths, Differences, CIDToGIDMap glyphs),
+  MAX_FONT_TEXT = 2^22 characters of ToUnicode text counted over every
+  insertion, and MAX_CMAP_DEST = 64 characters per ToUnicode destination.
+- One shown string operand: MAX_SHOW_CODES = 2^20 character codes.
 - Arrays and dictionaries nested deeper than MAX_NESTING = 256 levels are skipped.
 - Text more than 10 % of the page size outside the page box is dropped.
 - With --split-pages, page file paths relative to the output directory stay
@@ -102,6 +145,13 @@ definition. Code blocks use a fence longer than any backtick run inside.
   (character identifier (CID) fonts). Fonts that name glyphs only by number
   (g18, g152) and have none of these decode to wrong characters. Unmappable
   CID glyphs are written as U+FFFD.
+- Predefined CMaps of composite fonts are read with the code space of their
+  family (Identity, ISO-2022, UCS2, UTF16, UTF32, RKSJ, EUC, GBK, GBK2K, Big
+  Five, UHC, one-byte CMaps). The code-space tables are family approximations,
+  not the Adobe CMap files. The predefined CID-to-Unicode mappings are not
+  included, so text comes from ToUnicode or the embedded TrueType cmap. UTF8 and
+  other unknown CMap names use the ToUnicode code space, or two-byte codes with
+  an unsupported problem when there is none.
 - Vertical writing mode (Identity-V) is read as horizontal text.
 - Type 3 glyph size is taken from the font size. The glyph space em is unknown.
 - Fonts without a /Widths array use built-in widths for codes 32-126 of
@@ -109,10 +159,15 @@ definition. Code blocks use a fence longer than any backtick run inside.
   Word gaps in that text can be misdetected and its SVG text is not
   width-fitted.
 - Rotated text outside figures is dropped.
-- Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI) and
-  soft-mask transparency are not exported. Lab colors and images are converted
+- Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI), and
+  Indexed images with a /Decode other than the default or [2^bits-1 0] are not
+  exported and are reported. Soft-mask transparency (/SMask) is ignored without
+  a report; the image is exported opaque. Lab colors and images are converted
   to sRGB without chromatic adaptation, so colors with a D50 white point are
   slightly shifted.
+- When the cross-reference chain has one bad offset, the whole file is read by
+  scanning. The scan does not apply free entries, so an object freed in a later
+  revision can still be read; this case is reported as a problem.
 - SVG text uses generic font families, stretched to the original run width.
 """
 
@@ -3521,6 +3576,7 @@ class PageContent:
                     self._do(res, ops[-1], gs, depth)
                 elif op == 'BI':
                     self._skip_inline_image(lx)
+                    problem('unsupported', 'inline image (BI/ID/EI) not exported')
             except Exception as exc:
                 problem('internal', 'content operator %s: %s' % (op[:16], self._exc_text(exc)))
             ops = []
@@ -5359,7 +5415,6 @@ class Exporter:
     - files: (alt text, file path) of written raster images keyed by (id of the image
       stream, appearance); a repeated image with the same appearance reuses both.
     - counts: Counter of exported figures per label ('Image', 'Table', 'Figure').
-    - names: object number keyed by id of each stream object, built on first use.
     """
 
     def __init__(self, doc, assets_dir, md_dir):
@@ -5383,22 +5438,17 @@ class Exporter:
         self.files = {}
         ## Counter of exported figures per label ('Image', 'Table', 'Figure').
         self.counts = Counter()
-        ## object number keyed by id of each stream object, built on first use.
-        self.names = None
 
-    def _image_name(self, stream):
+    @staticmethod
+    def _image_name(stream):
         """!
         @brief Name an image stream for problem reports.
 
         @param stream Image XObject stream.
-        @return 'image N 0 R' with its object number, or 'image' for a direct object.
+        @return 'image N G R' with its object and generation number, or 'image' for a
+                direct object.
         """
-        if self.names is None:
-            self.names = {
-                id(o): num for num, o in self.doc.objects.items() if isinstance(o, Stream)
-            }
-        num = self.names.get(id(stream))
-        return 'image' if num is None else 'image %d 0 R' % num
+        return 'image' + stream.label()[len('stream') :]
 
     def raster(self, shape):
         """!

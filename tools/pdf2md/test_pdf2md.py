@@ -1059,6 +1059,23 @@ class LayoutLimits(Base):
         self.assertLess(elapsed, 5)
 
 
+class InlineImages(Base):
+    """!
+    @brief Inline images are skipped and reported.
+    """
+
+    def test_inline_image_is_reported(self):
+        """!
+        @brief Test: an inline image exits 3 with an unsupported problem; the text stays.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'q 10 0 0 10 72 600 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q\n')
+        rc, out, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('page 1: unsupported: inline image (BI/ID/EI) not exported', err)
+        self.assertIn('Hello world', _read(self.path('o.md')))
+
+
 class CommandLine(Base):
     """!
     @brief Options, exit codes, output paths and split mode.
