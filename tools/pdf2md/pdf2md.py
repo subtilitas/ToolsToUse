@@ -181,6 +181,15 @@ MAX_LAB_MEMO = 1 << 16
 MAX_FORM_RUNS = 2000
 ## @brief Upper limit for content stream operators executed for one page.
 MAX_PAGE_OPS = 5000000
+## @brief Upper limit for characters (Char objects) collected for one page: 1,000,000.
+##
+## A dense text page holds about 10,000. Further glyphs are not collected.
+MAX_PAGE_CHARS = 1000000
+## @brief Upper limit for grid cells that one box may occupy while clustering: 1024 cells.
+##
+## A cell is at least 64 x 64 points. Larger boxes are compared with every other box
+## directly instead of being entered into the grid.
+MAX_GRID_CELLS = 1024
 ## @brief Upper limit for distinct entries kept in PROBLEMS; further ones are only counted.
 MAX_PROBLEMS = 1000
 ## @brief Problems that made the output of the running conversion incomplete.
@@ -2919,10 +2928,23 @@ class PageContent:
         if key not in self.fonts:
             try:
                 font = Font(self.doc, fd)
-            except Exception:  # malformed font dictionary
+            except Exception as exc:  # malformed font dictionary
+                base = self.doc.resolve(fd.get('BaseFont')) if isinstance(fd, dict) else None
+                what = '/' + base if isinstance(base, str) else 'dictionary'
+                problem('internal', 'font %s: %s' % (what[:64], self._exc_text(exc)))
                 font = Font(self.doc, None)
             self.fonts[key] = (font, fd)  # keep fd alive so id() stays unique
         return self.fonts[key][0]
+
+    @staticmethod
+    def _exc_text(exc):
+        """!
+        @brief Describe an exception in one short line for problem().
+        @param exc exception object
+        @return 'ExcType: message' with the message cut to 80 characters on one line
+        """
+        msg = ' '.join(str(exc).split())
+        return '%s: %s' % (type(exc).__name__, msg[:77] + '...' if len(msg) > 80 else msg)
 
     def _font(self, res, name):
         """!
@@ -2945,7 +2967,8 @@ class PageContent:
         path painting (PAINT operators and n), text state and positioning, text showing
         (Tj, TJ, ', "), Do and inline images (skipped). Color space operators cs and CS
         reset the colour to black. Other operators are ignored.
-        An operator that raises an exception is skipped.
+        An operator that raises an exception is skipped and recorded with problem().
+        Reaching MAX_PAGE_OPS stops the page and is recorded as a limit.
         @param data decoded content stream bytes
         @param res resource dictionary or a reference to it
         @param gs initial graphics state; modified in place until the first Q restore
@@ -2970,7 +2993,9 @@ class PageContent:
                 continue
             self.op_count += 1
             if self.op_count > MAX_PAGE_OPS:
-                break  # page budget used up: the rest of the page is not drawn
+                # page budget used up: the rest of the page is not drawn
+                problem('limit', 'page reached MAX_PAGE_OPS (%d operators)' % MAX_PAGE_OPS)
+                break
             op = str(t)
             try:
                 if op == 'q':
@@ -3099,8 +3124,8 @@ class PageContent:
                     self._do(res, ops[-1], gs, depth)
                 elif op == 'BI':
                     self._skip_inline_image(lx)
-            except Exception:
-                pass
+            except Exception as exc:
+                problem('internal', 'content operator %s: %s' % (op[:16], self._exc_text(exc)))
             ops = []
 
     def _paint(self, path, gs, op):
@@ -3149,8 +3174,9 @@ class PageContent:
         @brief Execute the Do operator for an XObject.
 
         Form XObjects run with their Matrix applied to a copy of the state and their own
-        resources (or the current ones). Forms nested deeper than 12 levels, or already
-        being run, are skipped.
+        resources (or the current ones). Forms nested deeper than 12 levels, forms past
+        MAX_FORM_RUNS, forms already being run, missing XObjects and forms whose content
+        raises an exception are skipped and recorded with problem().
         Image XObjects become an 'image' Shape covering the unit square mapped by the
         CTM, unless no_shapes is set or the image is under 1 point in both width and
         height.
@@ -3161,25 +3187,37 @@ class PageContent:
         """
         r = self.doc.resolve
         xobjs = r(res.get('XObject'))
-        xo = r(xobjs.get(name)) if isinstance(xobjs, dict) else None
+        ref = xobjs.get(name) if isinstance(xobjs, dict) else None
+        what = '%d %d R' % (ref.num, ref.gen) if isinstance(ref, Ref) else '/' + str(name)[:64]
+        xo = r(ref)
         if not isinstance(xo, Stream):
+            problem('malformed', 'XObject %s: missing or not a stream' % what)
             return
         st = r(xo.get('Subtype'))
         if st == 'Form':
-            if depth > 12 or id(xo) in self._active or self.form_runs >= MAX_FORM_RUNS:
+            if id(xo) in self._active:
+                problem('malformed', 'form %s: draws itself' % what)
+                return
+            if depth > 12:
+                problem('limit', 'form %s: nested deeper than 12 levels' % what)
+                return
+            if self.form_runs >= MAX_FORM_RUNS:
+                problem('limit', 'page reached MAX_FORM_RUNS (%d form runs)' % MAX_FORM_RUNS)
                 return
             self.form_runs += 1
-            mat = r(xo.get('Matrix'))
-            mat = (
-                [float(r(v)) for v in mat]
-                if isinstance(mat, list) and len(mat) == 6
-                else [1, 0, 0, 1, 0, 0]
-            )
-            g = gs.copy()
-            g.ctm = mmul(mat, gs.ctm)
             self._active.add(id(xo))
             try:
+                mat = r(xo.get('Matrix'))
+                mat = (
+                    [float(r(v)) for v in mat]
+                    if isinstance(mat, list) and len(mat) == 6
+                    else [1, 0, 0, 1, 0, 0]
+                )
+                g = gs.copy()
+                g.ctm = mmul(mat, gs.ctm)
                 self.run(self.doc.decoded(xo), xo.get('Resources') or res, g, depth + 1)
+            except Exception as exc:
+                problem('internal', 'form %s: %s' % (what, self._exc_text(exc)))
             finally:
                 self._active.discard(id(xo))
         elif st == 'Image' and not self.no_shapes:
@@ -3217,11 +3255,8 @@ class PageContent:
         @brief Collect the text of visible annotation appearance streams.
 
         Covers form field values, free text and stamps. Their borders and backgrounds
-        are skipped because no_shapes is set while they run.
-        Skips Link, Popup, Text, FileAttachment and Sound annotations, and annotations
-        with the Hidden (2) or NoView (32) flag.
-        The normal appearance (AP N, selected by AS when it is a dictionary) is mapped
-        from its BBox and Matrix onto the annotation Rect.
+        are skipped because no_shapes is set while they run. An annotation that fails
+        is skipped and recorded with problem(); the other annotations still run.
         @param page page dictionary
         @param ctm page transformation matrix applied after the Rect mapping
         """
@@ -3231,56 +3266,74 @@ class PageContent:
             return
         self.no_shapes = True
         try:
-            for a in annots:
-                a = r(a)
-                if not isinstance(a, dict) or r(a.get('Subtype')) in (
-                    'Link',
-                    'Popup',
-                    'Text',
-                    'FileAttachment',
-                    'Sound',
-                ):
-                    continue
-                flags = r(a.get('F'))
-                if isinstance(flags, int) and flags & (2 | 32):  # Hidden, NoView
-                    continue
-                ap = r(a.get('AP'))
-                xo = r(ap.get('N')) if isinstance(ap, dict) else None
-                if isinstance(xo, dict):
-                    state = r(a.get('AS'))
-                    xo = r(xo.get(state)) if isinstance(state, str) else None
-                rect = r(a.get('Rect'))
-                if not isinstance(xo, Stream) or not isinstance(rect, list) or len(rect) != 4:
-                    continue
+            for k, a in enumerate(annots):
+                what = '%d %d R' % (a.num, a.gen) if isinstance(a, Ref) else '#%d' % (k + 1)
                 try:
-                    rx = [float(r(v)) for v in rect]
-                    bb = r(xo.get('BBox'))
-                    bb = (
-                        [float(r(v)) for v in bb]
-                        if isinstance(bb, list) and len(bb) == 4
-                        else [0, 0, 1, 1]
-                    )
-                    mat = r(xo.get('Matrix'))
-                    mat = (
-                        [float(r(v)) for v in mat]
-                        if isinstance(mat, list) and len(mat) == 6
-                        else [1, 0, 0, 1, 0, 0]
-                    )
-                except (TypeError, ValueError):
-                    continue
-                pts = [apply(mat, x, y) for x in (bb[0], bb[2]) for y in (bb[1], bb[3])]
-                tx0, ty0 = min(p[0] for p in pts), min(p[1] for p in pts)
-                tx1, ty1 = max(p[0] for p in pts), max(p[1] for p in pts)
-                if tx1 - tx0 <= 0 or ty1 - ty0 <= 0:
-                    continue
-                sx = (max(rx[0], rx[2]) - min(rx[0], rx[2])) / (tx1 - tx0)
-                sy = (max(rx[1], rx[3]) - min(rx[1], rx[3])) / (ty1 - ty0)
-                fit = [sx, 0, 0, sy, min(rx[0], rx[2]) - sx * tx0, min(rx[1], rx[3]) - sy * ty0]
-                g = GState()
-                g.ctm = mmul(mmul(mat, fit), ctm)
-                self.run(self.doc.decoded(xo), xo.get('Resources') or {}, g, 1)
+                    self._annotation(r(a), ctm, what)
+                except Exception as exc:
+                    problem('internal', 'annotation %s: %s' % (what, self._exc_text(exc)))
         finally:
             self.no_shapes = False
+
+    def _annotation(self, a, ctm, what):
+        """!
+        @brief Run the appearance stream of one annotation.
+
+        Skips Link, Popup, Text, FileAttachment and Sound annotations, and annotations
+        with the Hidden (2) or NoView (32) flag.
+        The normal appearance (AP N, selected by AS when it is a dictionary) is mapped
+        from its BBox and Matrix onto the annotation Rect. A Rect, BBox or Matrix with
+        non-numeric entries is recorded as malformed and the annotation is skipped.
+        @param a resolved annotation dictionary
+        @param ctm page transformation matrix applied after the Rect mapping
+        @param what annotation name for problem() texts, e.g. '12 0 R'
+        """
+        r = self.doc.resolve
+        if not isinstance(a, dict) or r(a.get('Subtype')) in (
+            'Link',
+            'Popup',
+            'Text',
+            'FileAttachment',
+            'Sound',
+        ):
+            return
+        flags = r(a.get('F'))
+        if isinstance(flags, int) and flags & (2 | 32):  # Hidden, NoView
+            return
+        ap = r(a.get('AP'))
+        xo = r(ap.get('N')) if isinstance(ap, dict) else None
+        if isinstance(xo, dict):
+            state = r(a.get('AS'))
+            xo = r(xo.get(state)) if isinstance(state, str) else None
+        rect = r(a.get('Rect'))
+        if not isinstance(xo, Stream) or not isinstance(rect, list) or len(rect) != 4:
+            return
+        try:
+            rx = [float(r(v)) for v in rect]
+            bb = r(xo.get('BBox'))
+            bb = (
+                [float(r(v)) for v in bb] if isinstance(bb, list) and len(bb) == 4 else [0, 0, 1, 1]
+            )
+            mat = r(xo.get('Matrix'))
+            mat = (
+                [float(r(v)) for v in mat]
+                if isinstance(mat, list) and len(mat) == 6
+                else [1, 0, 0, 1, 0, 0]
+            )
+        except (TypeError, ValueError):
+            problem('malformed', 'annotation %s: Rect, BBox or Matrix is not numeric' % what)
+            return
+        pts = [apply(mat, x, y) for x in (bb[0], bb[2]) for y in (bb[1], bb[3])]
+        tx0, ty0 = min(p[0] for p in pts), min(p[1] for p in pts)
+        tx1, ty1 = max(p[0] for p in pts), max(p[1] for p in pts)
+        if tx1 - tx0 <= 0 or ty1 - ty0 <= 0:
+            return
+        sx = (max(rx[0], rx[2]) - min(rx[0], rx[2])) / (tx1 - tx0)
+        sy = (max(rx[1], rx[3]) - min(rx[1], rx[3])) / (ty1 - ty0)
+        fit = [sx, 0, 0, sy, min(rx[0], rx[2]) - sx * tx0, min(rx[1], rx[3]) - sy * ty0]
+        g = GState()
+        g.ctm = mmul(mmul(mat, fit), ctm)
+        self.run(self.doc.decoded(xo), xo.get('Resources') or {}, g, 1)
 
     @staticmethod
     def _skip_inline_image(lx):
@@ -3308,6 +3361,9 @@ class PageContent:
         applies only to the single-byte code 32.
         Codes with empty text or a scaled size under 1 point produce no Char but still
         advance. A Type 3 fmat changes the glyph orientation, not the origin.
+        Once the page holds MAX_PAGE_CHARS characters, the rest of the string is not
+        collected, the text matrix is returned as advanced so far and the limit is
+        recorded with problem().
         @param gs current graphics state
         @param tm current text matrix
         @param s string operand bytes
@@ -3318,7 +3374,11 @@ class PageContent:
             return tm
         fs, th = gs.fs, gs.th
         fmat = font.fmat
+        room = MAX_PAGE_CHARS - len(self.chars)
         for code, nb in font.codes(s):
+            if room <= 0:
+                problem('limit', 'page reached MAX_PAGE_CHARS (%d characters)' % MAX_PAGE_CHARS)
+                return tm
             m = mmul(tm, gs.ctm)
             ox, oy = apply(m, 0, gs.rise)
             if fmat:
@@ -3342,6 +3402,7 @@ class PageContent:
             c.invisible = gs.tr in (3, 7)
             c.est = font.estimated
             self.chars.append(c)
+            room -= 1
         return tm
 
 
@@ -3397,8 +3458,11 @@ def _merge_pass(groups, gap):
     @brief Merge every pair of groups whose boxes overlap within gap (one pass).
 
     Pairs are found through a grid with cells of max(64, 4 * gap) points; connected
-    groups are joined with a union-find structure. A merged box can reach further
-    groups, so cluster() repeats the pass until the count stays the same.
+    groups are joined with a union-find structure. A box that would occupy more than
+    MAX_GRID_CELLS cells is not entered into the grid but compared with every other
+    group, so the work stays at most proportional to (large boxes x all boxes). A merged
+    box can reach further groups, so cluster() repeats the pass until the count stays
+    the same.
     @param groups list of [bbox list, member list, index of the last member in items]
     @param gap merge distance in points
     @return list of merged groups in the same form
@@ -3412,21 +3476,33 @@ def _merge_pass(groups, gap):
             i = parent[i]
         return i
 
+    def join(i, j):
+        if _overlap(groups[j][0], groups[i][0], gap):
+            a, b = find(i), find(j)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+
     grid = {}
+    large = []  # groups that would occupy more than MAX_GRID_CELLS cells
     for i, (bb, _, _) in enumerate(groups):
-        cx0, cx1 = int((bb[0] - gap) // size), int((bb[2] + gap) // size)
-        cy0, cy1 = int((bb[1] - gap) // size), int((bb[3] + gap) // size)
+        cx0, cx1 = (bb[0] - gap) // size, (bb[2] + gap) // size
+        cy0, cy1 = (bb[1] - gap) // size, (bb[3] + gap) // size
+        # also true for NaN and infinite coordinates, which int() would reject
+        if not (cx1 - cx0 + 1) * (cy1 - cy0 + 1) <= MAX_GRID_CELLS:
+            for j in range(i):
+                join(i, j)
+            large.append(i)
+            continue
+        for j in large:
+            join(i, j)
         seen = set()
-        for cx in range(cx0, cx1 + 1):
-            for cy in range(cy0, cy1 + 1):
+        for cx in range(int(cx0), int(cx1) + 1):
+            for cy in range(int(cy0), int(cy1) + 1):
                 cell = grid.setdefault((cx, cy), [])
                 for j in cell:
                     if j not in seen:
                         seen.add(j)
-                        if _overlap(groups[j][0], bb, gap):
-                            a, b = find(i), find(j)
-                            if a != b:
-                                parent[max(a, b)] = min(a, b)
+                        join(i, j)
                 cell.append(i)
     out = {}
     for i, (bb, members, last) in enumerate(groups):
@@ -3467,11 +3543,33 @@ class Region:
 
     def signature(self):
         """!
-        @brief Return a key that identifies a figure repeated at the same place.
-        @return tuple of the bbox coordinates rounded to whole points and the shape count
+        @brief Return a key that identifies the same figure repeated at the same place.
+
+        The key holds the bbox rounded to whole points, the shape count, one entry per
+        shape and the text of the characters in the region. An image entry is the
+        length and CRC-32 of the raw image stream bytes, so equal images match even
+        when stored as separate objects. A path entry lists its segments with the
+        coordinates rounded to whole points.
+        @return hashable tuple
         """
         b = self.bbox
-        return (round(b[0]), round(b[1]), round(b[2]), round(b[3]), len(self.shapes))
+        content = []
+        for s in self.shapes:
+            if s.kind == 'image':
+                raw = s.stream.raw if isinstance(s.stream, Stream) else b''
+                content.append(('image', len(raw), zlib.crc32(raw)))
+            else:
+                content.append(
+                    tuple(
+                        (g[0],) + tuple(round(v) if math.isfinite(v) else 0 for v in g[1:])
+                        for g in s.segs
+                    )
+                )
+        return (
+            (round(b[0]), round(b[1]), round(b[2]), round(b[3]), len(self.shapes)),
+            tuple(content),
+            ''.join(c.text for c in self.chars),
+        )
 
 
 class Line:
@@ -5420,8 +5518,10 @@ def _drop_repeats(layouts):
     The header and footer bands are the top and bottom 10 % of the page box height. A
     band line is dropped when its lowercase text, with digit runs replaced by #, occurs
     in the same band on at least max(3, 0.5 x page count) pages, or when it is a bare
-    page number (_PAGENUM_RE). With at least 3 pages, figure regions whose signature
-    (rounded box and shape count) occurs at least as often are dropped too.
+    page number (_PAGENUM_RE). With at least 3 pages, a figure region that lies wholly
+    inside one of the bands is dropped when its Region.signature (rounded box, shapes
+    and their content, and text) occurs in a band on at least as many pages. Figures
+    that reach outside the bands are always kept.
 
     @param layouts List of PageLayout objects; lines and regions are updated in place.
     """
@@ -5429,6 +5529,7 @@ def _drop_repeats(layouts):
     limit = max(3, 0.5 * n)
     keys = Counter()
     sigs = Counter()
+    band_sigs = {}  # id(region) -> signature, for regions wholly inside a band
     for lay in layouts:
         h = lay.box[3] - lay.box[1]
         top_band, bot_band = lay.box[3] - 0.1 * h, lay.box[1] + 0.1 * h
@@ -5437,7 +5538,16 @@ def _drop_repeats(layouts):
             if l.y >= top_band or l.y <= bot_band:
                 page_keys.add((re.sub(r'\d+', '#', l.text.lower()), l.y >= top_band))
         keys.update(page_keys)
-        sigs.update({r.signature() for r in lay.regions})
+        if n >= 3:
+            page_sigs = set()
+            for r in lay.regions:
+                b = r.bbox
+                if (top_band <= b[1] and b[3] <= lay.box[3]) or (
+                    lay.box[1] <= b[1] and b[3] <= bot_band
+                ):
+                    band_sigs[id(r)] = r.signature()
+                    page_sigs.add(band_sigs[id(r)])
+            sigs.update(page_sigs)
     for lay in layouts:
         h = lay.box[3] - lay.box[1]
         top_band, bot_band = lay.box[3] - 0.1 * h, lay.box[1] + 0.1 * h
@@ -5451,8 +5561,9 @@ def _drop_repeats(layouts):
                 continue
             kept.append(l)
         lay.lines = kept
-        if n >= 3:
-            lay.regions = [r for r in lay.regions if sigs[r.signature()] < limit]
+        lay.regions = [
+            r for r in lay.regions if id(r) not in band_sigs or sigs[band_sigs[id(r)]] < limit
+        ]
 
 
 def _heading_levels(layouts):
