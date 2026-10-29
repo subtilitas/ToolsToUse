@@ -230,7 +230,7 @@ class Parsing(Base):
         make_pdf(f, HELLO + b'/X0 Do', objs, resources=b'/XObject << /X0 6 0 R >>')
         t = time.time()
         rc, text = self.md(f, timeout=120)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 3)  # MAX_FORM_RUNS cut the page: reported as incomplete
         self.assertIn('Hello world', text)
         self.assertLess(time.time() - t, 60)
 
@@ -570,6 +570,155 @@ class Markdown(Base):
         """
         self.assertEqual(P._esc('__init__'), '\\_\\_init\\_\\_')
         self.assertEqual(P._esc('snake_case'), 'snake_case')
+
+
+class LayoutLimits(Base):
+    """!
+    @brief Clustering cost, repeated-figure removal, content errors and the character cap.
+    """
+
+    def pages(self, path, pages):
+        """!
+        @brief Write a PDF with one US Letter page per entry, each with font F1 (object 3).
+        @param path output file
+        @param pages list of (content stream, image pixel bytes or None); an image is a
+               10 x 1 RGB image named Im in the page resources
+        """
+        font = b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+        body = [b'<< /Type /Catalog /Pages 2 0 R >>', None, font]
+        kids = []
+        for content, img in pages:
+            n = len(body) + 1
+            kids.append(b'%d 0 R' % n)
+            res = b'/Font << /F1 3 0 R >>'
+            if img is not None:
+                res += b' /XObject << /Im %d 0 R >>' % (n + 2)
+            body.append(
+                b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents %d 0 R '
+                b'/Resources << %s >> >>' % (n + 1, res)
+            )
+            body.append(stream(content))
+            if img is not None:
+                body.append(
+                    stream(
+                        img,
+                        b'/Type /XObject /Subtype /Image /Width 10 /Height 1 '
+                        b'/ColorSpace /DeviceRGB /BitsPerComponent 8',
+                    )
+                )
+        body[1] = b'<< /Type /Pages /Kids [%s] /Count %d >>' % (b' '.join(kids), len(kids))
+        out = b'%PDF-1.4\n'
+        offs = []
+        for i, o in enumerate(body):
+            offs.append(len(out))
+            out += b'%d 0 obj\n' % (i + 1) + o + b'\nendobj\n'
+        x = len(out)
+        out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(body) + 1)
+        out += b''.join(b'%010d 00000 n \n' % o for o in offs)
+        out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(body) + 1, x)
+        _write(path, out)
+
+    def test_huge_page_with_long_diagonal_path_is_fast(self):
+        """!
+        @brief Test: a diagonal path across a 10^9 point page does not fill the cluster grid.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'0 0 m 500000000 500000000 l S', media=b'0 0 1000000000 1000000000')
+        t = time.time()
+        rc, _ = self.md(f, timeout=60)
+        self.assertEqual(rc, 0)
+        self.assertLess(time.time() - t, 5)
+
+    def test_different_full_page_scans_are_kept(self):
+        """!
+        @brief Test: three pages with different full-page images keep all three images.
+        """
+        f = self.path('a.pdf')
+        scan = b'q 612 0 0 792 0 0 cm /Im Do Q'
+        self.pages(f, [(scan, c * 10) for c in (b'\xff\0\0', b'\0\xff\0', b'\0\0\xff')])
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.count('!['), 3)
+
+    def test_repeated_logo_in_header_band_is_dropped(self):
+        """!
+        @brief Test: the same small image in the top band of 4 of 4 pages is dropped.
+        """
+        f = self.path('a.pdf')
+        self.pages(
+            f,
+            [
+                (
+                    b'q 50 0 0 50 72 720 cm /Im Do Q BT /F1 12 Tf 72 400 Td (Body %d) Tj ET' % k,
+                    b'\x80\x40\x20' * 10,
+                )
+                for k in range(4)
+            ],
+        )
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertNotIn('![', text)
+        self.assertIn('Body 3', text)
+
+    def test_repeated_figure_mid_page_is_kept(self):
+        """!
+        @brief Test: the same small image in the middle of 4 pages stays on every page.
+        """
+        f = self.path('a.pdf')
+        self.pages(
+            f,
+            [
+                (
+                    b'q 50 0 0 50 72 400 cm /Im Do Q BT /F1 12 Tf 72 300 Td (Body %d) Tj ET' % k,
+                    b'\x80\x40\x20' * 10,
+                )
+                for k in range(4)
+            ],
+        )
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.count('!['), 4)
+
+    def test_failing_operator_and_annotation_are_reported(self):
+        """!
+        @brief Test: an operator without operands and a non-numeric annotation Rect are
+        reported on stderr with exit code 3; the rest of the page is kept.
+        """
+        f = self.path('a.pdf')
+        make_pdf(
+            f,
+            b'Tf ' + HELLO,
+            [
+                b'<< /Type /Annot /Subtype /FreeText /Rect [(a) 0 100 100] /AP << /N 7 0 R >> >>',
+                stream(b'BT /F1 9 Tf 0 0 Td (x) Tj ET', b'/Type /XObject /Subtype /Form'),
+            ],
+            page=b'/Annots [6 0 R]',
+        )
+        rc, out, err = self.cli(f, '-o', self.path('out.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('page 1: internal: content operator Tf: IndexError', err)
+        self.assertIn('page 1: malformed: annotation 6 0 R: Rect, BBox or Matrix', err)
+        self.assertIn('Hello world', _read(self.path('out.md')))
+
+    def test_page_characters_are_capped(self):
+        """!
+        @brief Test: one Tj of 3 MB collects at most MAX_PAGE_CHARS characters and records
+        a limit problem.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, b'BT /F1 12 Tf 72 700 Td (' + b'a' * 3000000 + b') Tj ET')
+        old = P.MAX_PAGE_CHARS
+        P.MAX_PAGE_CHARS = 1000
+        try:
+            t = time.time()
+            _, _, layouts = P.analyze(f)
+            elapsed = time.time() - t
+            problems = list(P.PROBLEMS)
+        finally:
+            P.MAX_PAGE_CHARS = old
+        self.assertLessEqual(sum(len(l.chars) for l in layouts[0].lines), 1000)
+        self.assertIn((1, 'limit', 'page reached MAX_PAGE_CHARS (1000 characters)'), problems)
+        self.assertLess(elapsed, 5)
 
 
 class CommandLine(Base):
