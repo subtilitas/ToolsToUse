@@ -215,7 +215,7 @@ class Parsing(Base):
         _write(f, data)
         t = time.time()
         rc, _ = self.md(f)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 3)  # the cut font tables are reported as 'limit' problems
         self.assertLess(time.time() - t, 20)
 
     def test_form_fan_out_is_bounded(self):
@@ -468,6 +468,99 @@ class Layout(Base):
         """
         self.assertEqual(P._xml('a￾b￿c\x01d'), 'abcd')
         ET.fromstring('<t>%s</t>' % P._xml('x￿<&>'))
+
+
+class Fonts(Base):
+    """!
+    @brief Font decoding: predefined CMap code spaces and font table limits.
+    """
+
+    def type0_pdf(self, content, enc, cmap):
+        """!
+        @brief Write a PDF whose font F2 (object 6) is a Type0 font with a ToUnicode CMap.
+        @param content page content stream
+        @param enc Encoding value, e.g. b'/90ms-RKSJ-H'
+        @param cmap ToUnicode CMap data (object 7)
+        @return path of the PDF
+        """
+        f = self.path('a.pdf')
+        make_pdf(
+            f,
+            content,
+            [
+                b'<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding ' + enc + b' '
+                b'/DescendantFonts [8 0 R] /ToUnicode 7 0 R >>',
+                stream(cmap),
+                b'<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>',
+            ],
+        )
+        data = _readb(f).replace(b'/Font << /F1 5 0 R >>', b'/Font << /F1 5 0 R /F2 6 0 R >>')
+        _write(f, data)
+        return f
+
+    def test_rksj_encoding_reads_one_byte_codes(self):
+        """!
+        @brief Test: a Shift-JIS (RKSJ) predefined CMap reads ASCII bytes as one-byte codes.
+        """
+        cmap = (
+            b'begincmap 1 begincodespacerange <00> <FF> endcodespacerange '
+            b'2 beginbfchar <41> <0041> <42> <0042> endbfchar endcmap'
+        )
+        f = self.type0_pdf(b'BT /F2 12 Tf 72 700 Td (AB) Tj ET', b'/90ms-RKSJ-H', cmap)
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.strip(), 'AB')
+
+    def test_unknown_named_encoding_is_reported(self):
+        """!
+        @brief Test: an unknown predefined CMap name is read as two-byte codes and reported.
+        """
+        cmap = b'begincmap 1 beginbfchar <4142> <0058> endbfchar endcmap'
+        f = self.type0_pdf(b'BT /F2 12 Tf 72 700 Td (AB) Tj ET', b'/Foo-Bar-H', cmap)
+        rc, out, err = self.cli('-q', f, '-o', self.path('out.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('font X: encoding Foo-Bar-H parsed as two-byte codes', err)
+        self.assertEqual(_read(self.path('out.md')).strip(), 'X')
+
+    def test_hostile_tounicode_is_bounded(self):
+        """!
+        @brief Test: 300 bfranges with 1000-character destinations store bounded text.
+        """
+        dst = b'<' + b'0041' * 1000 + b'>'
+        ranges = b''.join(
+            b'<%04X> <%04X> ' % (i * 256, i * 256 + 255) + dst + b'\n' for i in range(300)
+        )
+        cmap = b'begincmap 300 beginbfrange\n' + ranges + b'endbfrange endcmap'
+        f = self.type0_pdf(b'BT /F2 12 Tf 72 700 Td <0000> Tj ET', b'/Identity-H', cmap)
+        t = time.time()
+        P.PROBLEMS.clear()
+        font = P.Font(P.Document(_readb(f)), P.Ref(6, 0))
+        self.assertLess(time.time() - t, 5)
+        stored = sum(len(v) for v in font.tounicode.values())
+        self.assertLessEqual(stored, P.MAX_FONT_TEXT)
+        self.assertLessEqual(max(len(v) for v in font.tounicode.values()), P.MAX_CMAP_DEST)
+        self.assertIn((None, 'limit', 'font X: MAX_FONT_TEXT limit reached'), P.PROBLEMS)
+        P.PROBLEMS.clear()
+        t = time.time()
+        rc, out, err = self.cli('-q', f, '-o', self.path('out.md'))
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(rc, 3)
+        self.assertIn('MAX_FONT_TEXT limit reached', err)
+
+    def test_long_string_codes_are_bounded(self):
+        """!
+        @brief Test: codes() stops after MAX_SHOW_CODES codes of one string operand.
+        """
+        P.PROBLEMS.clear()
+        font = P.Font(P.Document(b'%PDF-1.4\n'), {'Subtype': P.Name('Type1')})
+        t = time.time()
+        n = sum(1 for _ in font.codes(b'a' * (P.MAX_SHOW_CODES + 1000)))
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(n, P.MAX_SHOW_CODES)
+        self.assertTrue(any('MAX_SHOW_CODES' in k[2] for k in P.PROBLEMS))
+        P.PROBLEMS.clear()
+        self.assertEqual(len(list(font.codes(b'abc'))), 3)
+        self.assertEqual(P.PROBLEMS, {})
 
 
 class Markdown(Base):
