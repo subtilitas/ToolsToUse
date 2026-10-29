@@ -860,6 +860,228 @@ class CommandLine(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
+def _png_pixels(png):
+    """!
+    @brief Decode a PNG written by pdf2md (filter type 0 on every row).
+    @param png PNG file bytes
+    @return (width, height, color type, bit depth, row bytes without filter bytes)
+    """
+    w = int.from_bytes(png[16:20], 'big')
+    h = int.from_bytes(png[20:24], 'big')
+    depth, ctype = png[24], png[25]
+    idat = b''
+    i = 8
+    while i < len(png):
+        n = int.from_bytes(png[i : i + 4], 'big')
+        if png[i + 4 : i + 8] == b'IDAT':
+            idat += png[i + 8 : i + 8 + n]
+        i += 12 + n
+    raw = zlib.decompress(idat)
+    rowlen = len(raw) // h
+    rows = b''.join(raw[r * rowlen + 1 : (r + 1) * rowlen] for r in range(h))
+    return w, h, ctype, depth, rows
+
+
+class Images(Base):
+    """!
+    @brief Image export: placement transform, /Decode, limits and problem reports.
+    """
+
+    ## 2 x 2 DeviceRGB image object: red, green, blue, white
+    RGB = stream(
+        b'\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\xff',
+        b'/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB '
+        b'/BitsPerComponent 8',
+    )
+
+    def export(self, content, obj=None, page=b''):
+        """!
+        @brief Convert a page that draws image Im1 (object 6) and read the asset files.
+        @param content page content stream
+        @param obj image object, default RGB
+        @param page extra entries for the page dictionary
+        @return (exit code, stderr, {file name: bytes} of the asset files)
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, content, [obj or self.RGB], resources=b'/XObject << /Im1 6 0 R >>', page=page)
+        rc, _, err = self.cli(f, '-o', self.path('out.md'))
+        files = {}
+        adir = self.path('out_assets')
+        for name in sorted(os.listdir(adir)) if os.path.isdir(adir) else []:
+            files[name] = _readb(os.path.join(adir, name))
+        return rc, err, files
+
+    def test_rotated_image_exports_svg_with_transform(self):
+        """!
+        @brief Test: an image rotated by 90 degrees is exported as SVG with its matrix.
+        """
+        rc, err, files = self.export(b'q 0 200 -200 0 300 100 cm /Im1 Do Q')
+        self.assertEqual(list(files), ['p001_img1.svg'], err)
+        svg = files['p001_img1.svg'].decode('utf-8')
+        ET.fromstring(svg)
+        self.assertIn('matrix(0 200 -200 0 300 100) matrix(1 0 0 -1 0 1)', svg)
+        self.assertIn('data:image/png;base64,', svg)
+
+    def test_mirrored_image_exports_svg_with_transform(self):
+        """!
+        @brief Test: a horizontally mirrored image is exported as SVG with its matrix.
+        """
+        rc, err, files = self.export(b'q -200 0 0 200 300 100 cm /Im1 Do Q')
+        self.assertEqual(list(files), ['p001_img1.svg'], err)
+        self.assertIn('matrix(-200 0 0 200 300 100)', files['p001_img1.svg'].decode('utf-8'))
+
+    def test_upright_image_exports_png(self):
+        """!
+        @brief Test: an axis-aligned upright image is still exported as a plain PNG.
+        """
+        rc, err, files = self.export(b'q 200 0 0 100 100 100 cm /Im1 Do Q')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(list(files), ['p001_img1.png'])
+        self.assertEqual(_png_pixels(files['p001_img1.png'])[4][:3], b'\xff\x00\x00')
+
+    def test_rotated_page_image_exports_svg(self):
+        """!
+        @brief Test: an upright image on a page with /Rotate 90 is exported rotated.
+        """
+        rc, err, files = self.export(b'q 200 0 0 100 100 100 cm /Im1 Do Q', page=b'/Rotate 90')
+        self.assertEqual(list(files), ['p001_img1.svg'], err)
+
+    def test_same_image_two_placements_two_files(self):
+        """!
+        @brief Test: one image stream drawn upright and mirrored gives two files.
+        """
+        rc, err, files = self.export(
+            b'q 100 0 0 100 50 50 cm /Im1 Do Q q -100 0 0 100 450 600 cm /Im1 Do Q'
+        )
+        self.assertEqual(sorted(f.rsplit('.', 1)[1] for f in files), ['png', 'svg'], err)
+
+    def test_rgb_decode_inverts_components(self):
+        """!
+        @brief Test: /Decode [1 0 1 0 1 0] on a DeviceRGB image inverts each component.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {
+                'Width': 1,
+                'Height': 1,
+                'BitsPerComponent': 8,
+                'ColorSpace': 'DeviceRGB',
+                'Decode': [1, 0, 1, 0, 1, 0],
+            },
+            b'\xff\x00\x00',
+        )
+        ext, png = P.image_file(doc, s, {})
+        self.assertEqual(_png_pixels(png)[4], b'\x00\xff\xff')
+
+    def test_cmyk_and_interval_decode(self):
+        """!
+        @brief Test: /Decode on CMYK and a general interval on RGB map each component.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {
+                'Width': 1,
+                'Height': 1,
+                'BitsPerComponent': 8,
+                'ColorSpace': 'DeviceCMYK',
+                'Decode': [1, 0, 0, 1, 0, 1, 0, 1],
+            },
+            b'\xff\x00\x00\x00',
+        )
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\xff\xff\xff')
+        s = P.Stream(
+            {
+                'Width': 1,
+                'Height': 1,
+                'BitsPerComponent': 8,
+                'ColorSpace': 'DeviceRGB',
+                'Decode': [0, 0.5, 0.5, 1, 0, 1],
+            },
+            b'\xff\x00\x80',
+        )
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\x80\x80\x80')
+
+    def test_indexed_decode(self):
+        """!
+        @brief Test: Indexed /Decode [N 0] reverses the index; other arrays are reported.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        cs = ['Indexed', 'DeviceGray', 1, b'\x00\xff']
+        s = P.Stream({'Width': 8, 'Height': 1, 'BitsPerComponent': 1, 'ColorSpace': cs}, b'\x0f')
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\x0f')
+        s.dict['Decode'] = [1, 0]
+        self.assertEqual(_png_pixels(P.image_file(doc, s, {})[1])[4], b'\xf0')
+        s.dict['Decode'] = [0, 0.5]
+        why = []
+        self.assertIsNone(P.image_file(doc, s, {}, why))
+        self.assertEqual(why[0][0], 'unsupported')
+
+    def test_image_side_limit_for_native_formats(self):
+        """!
+        @brief Test: a JPEG wider than MAX_IMAGE_SIDE is not exported and is reported.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {'Width': P.MAX_IMAGE_SIDE + 1, 'Height': 1, 'Filter': 'DCTDecode'}, b'\xff\xd8'
+        )
+        why = []
+        self.assertIsNone(P.image_file(doc, s, {}, why))
+        self.assertEqual(why[0][0], 'limit')
+        s.dict['Width'] = 1
+        self.assertEqual(P.image_file(doc, s, {}), ('jpg', b'\xff\xd8'))
+
+    def test_large_png_is_fast(self):
+        """!
+        @brief Test: a 4096 x 4096 gray image converts within a few seconds.
+        """
+        doc = P.Document(b'%PDF-1.4\n')
+        s = P.Stream(
+            {'Width': 4096, 'Height': 4096, 'BitsPerComponent': 8, 'ColorSpace': 'DeviceGray'},
+            bytes(range(256)) * 65536,
+        )
+        t = time.time()
+        ext, png = P.image_file(doc, s, {})
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(_png_pixels(png)[4][:3], b'\x00\x01\x02')
+
+    def test_unsupported_image_is_reported(self):
+        """!
+        @brief Test: a JBIG2 image gives exit code 3 and a named problem line.
+        """
+        obj = stream(
+            b'\x00' * 8,
+            b'/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray '
+            b'/BitsPerComponent 1 /Filter /JBIG2Decode',
+        )
+        rc, err, files = self.export(b'q 200 0 0 200 100 100 cm /Im1 Do Q', obj)
+        self.assertEqual(rc, 3)
+        self.assertIn('page 1: unsupported: image 6 0 R: JBIG2Decode not exported', err)
+        self.assertIn('not exported', _read(self.path('out.md')))
+
+    def test_conversion_exception_is_reported(self):
+        """!
+        @brief Test: an exception inside image_file is recorded as an internal problem.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, b'', [self.RGB])
+        doc = P.Document(_readb(f))
+        sh = P.Shape()
+        sh.stream, sh.resources = doc.objects[6], {}
+        ex = P.Exporter(doc, self.path('assets'), self.dir)
+        old = P.image_file
+        P.image_file = lambda *a: 1 / 0
+        P.PROBLEMS.clear()
+        try:
+            self.assertIsNone(ex.raster(sh))
+        finally:
+            P.image_file = old
+        self.assertEqual(
+            list(P.PROBLEMS),
+            [(None, 'internal', 'image 6 0 R: ZeroDivisionError: division by zero')],
+        )
+        P.PROBLEMS.clear()
+
+
 class Contents(Base):
     """!
     @brief Printed table of contents detection.
