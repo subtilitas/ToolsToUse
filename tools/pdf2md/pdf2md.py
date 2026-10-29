@@ -158,8 +158,15 @@ _OPS = {}
 MAX_REL_PATH = 160
 ## @brief Arrays and dictionaries nested deeper than this are skipped (parsed as None).
 MAX_NESTING = 256
-## @brief Upper limit in bytes for one decoded stream. Longer output is cut off.
+## @brief Upper limit in bytes for one decoded stream (256 MiB), checked after every
+## filter stage and inside the expanding decoders. Longer output is cut off.
 MAX_DECODED = 1 << 28
+## @brief Upper limit in bytes for all decoded streams cached by one Document (1 GiB).
+## Streams decoded after the cache is full are returned without being cached.
+MAX_DOC_DECODED = 1 << 30
+## @brief Upper limit for LZWDecode dictionary entries (4096, the 12-bit code space).
+## A full dictionary stops growing until a clear code.
+MAX_LZW_TABLE = 4096
 ## @brief Upper limit for code, width and glyph table entries built for one font.
 MAX_FONT_ENTRIES = 1 << 20
 ## @brief Upper limit for the characters stored in the ToUnicode values of one font
@@ -284,21 +291,38 @@ class Stream:
     @par Attributes
     - dict: the stream dictionary.
     - raw: the stream bytes as stored in the file, still encoded.
+    - num: object number, or None for a stream that is not an indirect object.
+    - gen: generation number, or None like num.
     """
 
     ## Attribute names; each is described in the class documentation.
-    __slots__ = ('dict', 'raw')
+    __slots__ = ('dict', 'raw', 'num', 'gen')
 
-    def __init__(self, dct, raw):
+    def __init__(self, dct, raw, num=None, gen=None):
         """!
         @brief Store the stream dictionary and its raw bytes.
         @param dct stream dictionary.
         @param raw undecoded stream bytes.
+        @param num object number, or None.
+        @param gen generation number, or None.
         """
         ## the stream dictionary.
         self.dict = dct
         ## the stream bytes as stored in the file, still encoded.
         self.raw = raw
+        ## object number, or None for a stream that is not an indirect object.
+        self.num = num
+        ## generation number, or None like num.
+        self.gen = gen
+
+    def label(self):
+        """!
+        @brief Name the stream for problem() messages.
+        @return 'stream N G R', or 'stream' when the object number is not known.
+        """
+        if self.num is None:
+            return 'stream'
+        return 'stream %d %d R' % (self.num, self.gen or 0)
 
     def get(self, key, default=None):
         """!
@@ -602,7 +626,8 @@ def _predict(data, parms):
     Predictor 2 (TIFF) is undone only for 8 bits per component, else data is unchanged.
     Any predictor above 2 is read as PNG rows: one filter-type byte, then the row.
     PNG filter types 1 (Sub), 2 (Up), 3 (Average) and 4 (Paeth) are undone; other
-    types copy the row. A short last row is padded with zero bytes.
+    types copy the row. A short last row is padded with zero bytes. Output stops at
+    MAX_DECODED bytes.
     @param data decoded filter output.
     @param parms decode parameter dictionary (Predictor, Colors, BitsPerComponent, Columns).
     @return the reconstructed bytes.
@@ -658,6 +683,9 @@ def _predict(data, parms):
                 row[j] = (row[j] + pr) & 0xFF
         out += row
         prev = row
+        if len(out) >= MAX_DECODED:
+            del out[MAX_DECODED:]
+            break
     return bytes(out)
 
 
@@ -667,7 +695,9 @@ def _lzw(data, parms):
 
     Codes start at 9 bits and grow to at most 12 bits. Code 256 clears the table and
     code 257 ends the data. /EarlyChange (default 1) sets when the code width grows.
-    An invalid code ends decoding and returns the output so far.
+    The dictionary holds at most MAX_LZW_TABLE entries; when it is full, no entries are
+    added until a clear code. An invalid code ends decoding and returns the output so
+    far. Output stops at MAX_DECODED bytes.
     @param data compressed bytes.
     @param parms decode parameter dictionary, or another value for defaults.
     @return the decoded bytes.
@@ -695,8 +725,9 @@ def _lzw(data, parms):
                 entry = table[code]
             elif code < len(table):
                 entry = table[code]
-                table.append(prev + entry[:1])
-            elif code == len(table):
+                if len(table) < MAX_LZW_TABLE:
+                    table.append(prev + entry[:1])
+            elif code == len(table) and code < MAX_LZW_TABLE:
                 entry = prev + prev[:1]
                 table.append(entry)
             else:
@@ -714,9 +745,12 @@ def _a85(data):
     """!
     @brief Decode ASCII85Decode data.
 
-    Whitespace is removed, a leading <~ is skipped and the data ends at ~>.
+    Whitespace is removed, a leading <~ is skipped and the data ends at ~>. Input that
+    could expand beyond MAX_DECODED bytes (z stands for 4 bytes) is decoded in pieces,
+    and output stops at MAX_DECODED bytes.
     @param data encoded bytes.
     @return the decoded bytes.
+    @exception ValueError when the data holds bytes that are not ASCII85.
     """
     data = re.sub(rb'\s', b'', data)
     if data.startswith(b'<~'):
@@ -724,7 +758,21 @@ def _a85(data):
     end = data.find(b'~>')
     if end >= 0:
         data = data[:end]
-    return base64.a85decode(data)
+    zs = data.count(b'z')
+    if 4 * zs + len(data) - zs <= MAX_DECODED:
+        return base64.a85decode(data)
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n and len(out) < MAX_DECODED:
+        j = min(n, i + (1 << 20))
+        groups = (j - i) - data.count(b'z', i, j)  # characters outside z, in 5-byte groups
+        while groups % 5 and j < n:
+            groups += data[j] != 0x7A
+            j += 1
+        out += base64.a85decode(data[i:j])
+        i = j
+    del out[MAX_DECODED:]
+    return bytes(out)
 
 
 def _ahx(data):
@@ -732,14 +780,14 @@ def _ahx(data):
     @brief Decode ASCIIHexDecode data.
 
     The data ends at the first >. Non-hex bytes are ignored and an odd digit count is
-    padded with 0.
+    padded with 0. Output stops at MAX_DECODED bytes.
     @param data encoded bytes.
     @return the decoded bytes.
     """
     end = data.find(b'>')
     if end >= 0:
         data = data[:end]
-    hx = re.sub(rb'[^0-9A-Fa-f]', b'', data)
+    hx = re.sub(rb'[^0-9A-Fa-f]', b'', data)[: 2 * MAX_DECODED]
     if len(hx) % 2:
         hx += b'0'
     return bytes.fromhex(hx.decode('ascii'))
@@ -750,7 +798,7 @@ def _rld(data):
     @brief Decode RunLengthDecode data.
 
     A length byte below 128 copies the next length+1 bytes. A byte above 128 repeats
-    the next byte 257-length times. 128 ends the data.
+    the next byte 257-length times. 128 ends the data. Output stops at MAX_DECODED bytes.
     @param data encoded bytes.
     @return the decoded bytes.
     """
@@ -778,29 +826,70 @@ def _rld(data):
 IMAGE_FILTERS = {'DCTDecode', 'DCT', 'JPXDecode', 'JBIG2Decode', 'CCITTFaxDecode', 'CCF'}
 
 
+def _size_text(n):
+    """!
+    @brief Format a byte count for problem() messages.
+    @param n number of bytes.
+    @return text such as '256 MiB', or '1000 bytes' when n is not a whole number of MiB.
+    """
+    if n >= 1 << 20 and n % (1 << 20) == 0:
+        return '%d MiB' % (n >> 20)
+    return '%d bytes' % n
+
+
+def _one_line(exc):
+    """!
+    @brief Describe an exception in one line for problem() messages.
+    @param exc the exception.
+    @return the exception message with runs of whitespace collapsed, or its type name
+    when the message is empty.
+    """
+    return ' '.join(str(exc).split()) or type(exc).__name__
+
+
 # ---------------------------------------------------------------------------
 # Document
 # ---------------------------------------------------------------------------
 
 ## @brief Pattern for an "num gen obj" object header not preceded by a digit.
 _OBJ_RE = re.compile(rb'(?<![0-9])(\d+)\s+(\d+)\s+obj\b')
+## @brief Pattern for the object header that a cross-reference offset points to.
+##
+## Leading whitespace is allowed. Group 1: object number. Group 2: generation number.
+_XOBJ_RE = re.compile(rb'\s*(\d+)\s+(\d+)\s+obj\b')
 ## @brief Pattern for the start of a trailer dictionary.
 _TRAILER_RE = re.compile(rb'trailer\s*<<')
+## @brief Pattern for the xref keyword that starts a cross-reference table.
+_XREF_RE = re.compile(rb'(?<![A-Za-z])xref\s')
+## @brief Pattern for the last startxref keyword and the offset after it (group 1).
+_STARTXREF_RE = re.compile(rb'startxref\s+(\d+)')
+## @brief Pattern for a cross-reference subsection header "first count".
+_XSUB_RE = re.compile(rb'\s*(\d+)\s+(\d+)(?=\s)')
+## @brief Pattern for one cross-reference table entry "offset generation n" or "... f".
+_XENT_RE = re.compile(rb'\s*(\d+)\s+(\d+)\s+([nf])')
 
 
 class Document:
     """!
     @brief Parsed PDF file: object table, trailer and access to pages, labels and outline.
 
-    Objects are found by scanning the whole file for object headers, not by reading
-    the cross-reference table.
+    Objects are loaded through the cross-reference chain that starts at the last
+    startxref: classic tables, cross-reference streams (/W, /Index) and hybrid files
+    (/XRefStm), following /Prev. The newest revision wins, objects that it marks free
+    are not loaded, and a reference whose generation number differs from the loaded
+    object's resolves to None. When the chain cannot be read or an offset does not
+    point to the object it names, the whole file is scanned for object headers
+    instead; a later definition then wins.
 
     @par Attributes
     - data: the file bytes.
     - objects: object number to parsed object (dict, list, Stream, number, ...).
     - objpos: object number to byte offset of its definition; objects from an object
       stream get the offset of that stream.
+    - gens: object number to generation number, for objects whose generation is not 0.
     - _dec: cache of decoded stream bytes keyed by id() of the Stream.
+    - _dec_size: total bytes held in _dec, at most MAX_DOC_DECODED.
+    - _spans: (start, end) byte ranges of the objects found by the scan, in file order.
     - trailer: merged trailer dictionary.
     - encrypted: True when the trailer has an /Encrypt entry.
     """
@@ -809,8 +898,12 @@ class Document:
         """!
         @brief Parse a PDF file held in memory.
 
-        Scans objects, expands object streams, fixes stream lengths given as references
-        and builds the trailer.
+        Reads the cross-reference chain. When that fails, scans for objects, expands
+        object streams, fixes stream lengths given as references and builds the trailer
+        from the trailer dictionaries outside objects and comments. The scan is
+        recorded with problem() when no cross-reference section can be read or the
+        sections found disagree with the scanned objects. When /Root does not resolve
+        to a dictionary, the first /Type /Catalog object is used as root.
         @param data the whole file as bytes.
         @exception PDFError when no %PDF header is in the first 1024 bytes.
         """
@@ -823,14 +916,40 @@ class Document:
         ## object number to byte offset of its definition; objects from an object
         ## stream get the offset of that stream.
         self.objpos = {}
+        ## object number to generation number, for objects whose generation is not 0.
+        self.gens = {}
         ## cache of decoded stream bytes keyed by id() of the Stream.
         self._dec = {}
-        pending = self._scan()
-        self._fix_lengths(pending)
-        self._expand_object_streams()
-        self._fix_lengths(pending)
+        ## total bytes held in _dec, at most MAX_DOC_DECODED.
+        self._dec_size = 0
+        ## (start, end) byte ranges of the objects found by the scan, in file order.
+        self._spans = []
+        saved = dict(PROBLEMS)
+        try:
+            trailer = self._load_xref()
+        except Exception:  # any damage in the chain: recover by scanning
+            trailer = None
+        if trailer is None:
+            PROBLEMS.clear()
+            PROBLEMS.update(saved)
+            self.objects, self.objpos, self.gens = {}, {}, {}
+            self._dec, self._dec_size = {}, 0
+            pending = self._scan()
+            self._fix_lengths(pending)
+            self._expand_object_streams()
+            self._fix_lengths(pending)
+            trailer = self._trailer()
+            if not self._scan_agrees():
+                problem(
+                    'malformed', 'cross-reference table unreadable; objects recovered by scanning'
+                )
+        if not isinstance(self.resolve(trailer.get('Root')), dict):
+            for num, o in self.objects.items():
+                if isinstance(o, dict) and o.get('Type') == 'Catalog':
+                    trailer['Root'] = Ref(num, self.gens.get(num, 0))
+                    break
         ## merged trailer dictionary.
-        self.trailer = self._trailer()
+        self.trailer = trailer
         ## True when the trailer has an /Encrypt entry.
         self.encrypted = 'Encrypt' in self.trailer
 
@@ -844,16 +963,208 @@ class Document:
         """
         return self.data[p : p + 32].lstrip().startswith(b'endstream')
 
+    def _read_object(self, pos):
+        """!
+        @brief Parse the object that follows an "num gen obj" header.
+
+        A stream uses /Length when that is a direct integer followed by endstream;
+        otherwise its data runs to the next endstream, without the end-of-line before it.
+        @param pos byte offset just after the obj keyword.
+        @return tuple (object, end offset, data start offset of a stream whose /Length is
+        an indirect reference, else None).
+        """
+        d = self.data
+        lx = Lexer(d, pos)
+        val = lx.value()
+        end = lx.p
+        if not isinstance(val, dict):
+            return val, end, None
+        t = lx.token()
+        if not (isinstance(t, Op) and t == 'stream'):
+            return val, end, None
+        start = lx.p
+        if d[start : start + 2] == b'\r\n':
+            start += 2
+        elif d[start : start + 1] in (b'\n', b'\r'):
+            start += 1
+        length = val.get('Length')
+        if type(length) is int and length >= 0 and self._valid_end(start + length):
+            return Stream(val, d[start : start + length]), start + length, None
+        e = d.find(b'endstream', start)
+        if e < 0:
+            e = len(d)
+        stop = e
+        if d[stop - 2 : stop] == b'\r\n':
+            stop -= 2
+        elif d[stop - 1 : stop] in (b'\n', b'\r'):
+            stop -= 1
+        pend = start if isinstance(length, Ref) else None
+        return Stream(val, d[start : max(start, stop)]), e + 9, pend
+
+    def _xref_stream_entries(self, s):
+        """!
+        @brief Read the entries of a /Type /XRef cross-reference stream.
+
+        Entries of a type other than 0, 1 and 2 are returned too; they stand for null.
+        @param s the cross-reference Stream.
+        @return list of (object number, (type, field 2, field 3)). Type 0 is free, type 1
+        is (1, offset, generation) and type 2 is (2, object stream number, index).
+        @exception PDFError when /W or /Index is invalid or the data does not decode.
+        """
+        w = s.get('W')
+        if not (isinstance(w, list) and len(w) == 3):
+            raise PDFError('invalid /W')
+        if not all(type(v) is int and 0 <= v <= 8 for v in w) or not (w[1] or w[2]):
+            raise PDFError('invalid /W')
+        index = s.get('Index', [0, s.get('Size')])
+        if not isinstance(index, list):
+            raise PDFError('invalid /Index')
+        data, native = self.decode(s)
+        if native:
+            raise PDFError('image filter on a cross-reference stream')
+        w0, w1, w2 = w
+        rl = w0 + w1 + w2
+        fb = int.from_bytes
+        out = []
+        p = 0
+        for i in range(0, len(index) - 1, 2):
+            first, count = index[i], index[i + 1]
+            if type(first) is not int or type(count) is not int or first < 0:
+                raise PDFError('invalid /Index')
+            count = min(count, (len(data) - p) // rl)
+            for k in range(count):
+                t = fb(data[p : p + w0], 'big') if w0 else 1
+                f2 = fb(data[p + w0 : p + w0 + w1], 'big')
+                f3 = fb(data[p + w0 + w1 : p + rl], 'big')
+                p += rl
+                out.append((first + k, (t, f2, f3)))
+        return out
+
+    def _xref_section(self, pos):
+        """!
+        @brief Read one cross-reference section: a classic table or a cross-reference stream.
+        @param pos byte offset of the xref keyword or of the stream's object header.
+        @return tuple (list of entries as from _xref_stream_entries, trailer dictionary).
+        For a stream, the trailer is the stream dictionary.
+        @exception PDFError when no valid section starts at pos.
+        """
+        d = self.data
+        lx = Lexer(d, pos)
+        t = lx.token()
+        if type(t) is int:
+            hm = _XOBJ_RE.match(d, pos)
+            if not hm:
+                raise PDFError('no object header at %d' % pos)
+            s = self._read_object(hm.end())[0]
+            if not isinstance(s, Stream) or s.get('Type') != 'XRef':
+                raise PDFError('object at %d is not a cross-reference stream' % pos)
+            s.num, s.gen = int(hm.group(1)), int(hm.group(2))
+            return self._xref_stream_entries(s), s.dict
+        if not (isinstance(t, Op) and t == 'xref'):
+            raise PDFError('no cross-reference section at %d' % pos)
+        out = []
+        p = lx.p
+        while True:
+            h = _XSUB_RE.match(d, p)
+            if not h:
+                break
+            first, count = int(h.group(1)), int(h.group(2))
+            p = h.end()
+            for k in range(count):
+                e = _XENT_RE.match(d, p)
+                if not e:
+                    break
+                p = e.end()
+                if e.group(3) == b'n':
+                    out.append((first + k, (1, int(e.group(1)), int(e.group(2)))))
+                else:
+                    out.append((first + k, (0, 0, int(e.group(2)))))
+        lx = Lexer(d, p)
+        t = lx.token()
+        trailer = lx.value() if isinstance(t, Op) and t == 'trailer' else None
+        if not isinstance(trailer, dict):
+            raise PDFError('no trailer after the cross-reference table at %d' % pos)
+        return out, trailer
+
+    def _load_xref(self):
+        """!
+        @brief Load the objects named by the cross-reference chain from the last startxref.
+
+        For each object number the newest entry wins: a section's table entries, then its
+        /XRefStm stream, then the /Prev sections. Type 1 entries are parsed at their
+        offset, type 2 entries are read from their object stream. Free and unknown entries
+        are not loaded.
+        @return the merged trailer dictionary, or None when there is no startxref or no
+        object was loaded.
+        @exception PDFError when a section is invalid or an offset does not point to the
+        header of the object it names.
+        """
+        d = self.data
+        k = d.rfind(b'startxref')
+        m = _STARTXREF_RE.match(d, k) if k >= 0 else None
+        if not m:
+            return None
+        entries = {}
+        trailers = []
+        pos, seen = int(m.group(1)), set()
+        while pos is not None and pos not in seen:
+            seen.add(pos)
+            sec, trailer = self._xref_section(pos)
+            for num, ent in sec:
+                entries.setdefault(num, ent)
+            trailers.append(trailer)
+            hybrid = trailer.get('XRefStm')
+            if type(hybrid) is int and 'W' not in trailer and hybrid not in seen:
+                seen.add(hybrid)
+                for num, ent in self._xref_section(hybrid)[0]:
+                    entries.setdefault(num, ent)
+            prev = trailer.get('Prev')
+            pos = prev if type(prev) is int else None
+        merged = {}
+        for t in reversed(trailers):
+            merged.update(t)
+        pending = []
+        packed = {}
+        for num, (t, a, b) in entries.items():
+            if t == 1 and num:
+                hm = _XOBJ_RE.match(d, a)
+                if not hm or int(hm.group(1)) != num or int(hm.group(2)) != b:
+                    raise PDFError('object %d %d R is not at offset %d' % (num, b, a))
+                val, _, plen = self._read_object(hm.end())
+                if isinstance(val, Stream):
+                    val.num, val.gen = num, b
+                    if plen is not None:
+                        pending.append((val, plen))
+                self.objects[num] = val
+                self.objpos[num] = a
+                if b:
+                    self.gens[num] = b
+            elif t == 2:
+                packed.setdefault(a, []).append(num)
+        if not self.objects:
+            return None
+        self._fix_lengths(pending)
+        for snum, nums in packed.items():
+            s = self.objects.get(snum)
+            if not isinstance(s, Stream):
+                raise PDFError('object stream %d 0 R is missing' % snum)
+            data, first, pairs = self._objstm_entries(s)
+            offs = dict(pairs)
+            for onum in nums:
+                if onum in offs:
+                    self.objects[onum] = Lexer(data, first + offs[onum]).value()
+                    self.objpos[onum] = self.objpos[snum]
+        return merged
+
     def _scan(self):
         """!
         @brief Find every "num gen obj" header in the file and parse its object.
 
         A later definition of the same number replaces an earlier one. Matches inside a
-        parsed object or stream are skipped. A stream uses /Length when that is a direct
-        integer followed by endstream; otherwise its data runs to the next endstream,
-        without the end-of-line before it.
-        @return list of (object number, data start offset) for streams whose /Length is
-        an indirect reference.
+        parsed object or stream are skipped. The byte range of each object is kept in
+        _spans.
+        @return list of (Stream, data start offset) for streams whose /Length is an
+        indirect reference.
         """
         d = self.data
         pending = []
@@ -861,44 +1172,22 @@ class Document:
         for m in _OBJ_RE.finditer(d):
             if m.start() < skip:
                 continue
-            num = int(m.group(1))
-            lx = Lexer(d, m.end())
+            num, gen = int(m.group(1)), int(m.group(2))
             try:
-                val = lx.value()
-            except Exception:
+                val, end, plen = self._read_object(m.end())
+            except Exception:  # unparsable object: the scan goes on at the next header
                 continue
-            end = lx.p
-            if isinstance(val, dict):
-                save = lx.p
-                t = lx.token()
-                if isinstance(t, Op) and t == 'stream':
-                    start = lx.p
-                    if d[start : start + 2] == b'\r\n':
-                        start += 2
-                    elif d[start : start + 1] in (b'\n', b'\r'):
-                        start += 1
-                    length = val.get('Length')
-                    if type(length) is int and length >= 0 and self._valid_end(start + length):
-                        raw = d[start : start + length]
-                        end = start + length
-                    else:
-                        e = d.find(b'endstream', start)
-                        if e < 0:
-                            e = len(d)
-                        stop = e
-                        if d[stop - 2 : stop] == b'\r\n':
-                            stop -= 2
-                        elif d[stop - 1 : stop] in (b'\n', b'\r'):
-                            stop -= 1
-                        raw = d[start : max(start, stop)]
-                        end = e + 9
-                        if isinstance(length, Ref):
-                            pending.append((num, start))
-                    val = Stream(val, raw)
-                else:
-                    lx.p = save
+            if isinstance(val, Stream):
+                val.num, val.gen = num, gen
+                if plen is not None:
+                    pending.append((val, plen))
             self.objects[num] = val
             self.objpos[num] = m.start()
+            if gen:
+                self.gens[num] = gen
+            else:
+                self.gens.pop(num, None)
+            self._spans.append((m.start(), end))
             skip = end
         return pending
 
@@ -907,66 +1196,105 @@ class Document:
         @brief Re-cut stream data using indirect /Length values once they can be resolved.
 
         The new length is used only when endstream follows it.
-        @param pending list of (object number, data start offset) from _scan().
+        @param pending list of (Stream, data start offset) from _read_object().
         """
-        for num, start in pending:
-            s = self.objects.get(num)
-            if not isinstance(s, Stream):
-                continue
+        for s, start in pending:
             n = self.resolve(s.get('Length'))
             if type(n) is int and n >= 0 and self._valid_end(start + n):
                 s.raw = self.data[start : start + n]
+
+    def _objstm_entries(self, s):
+        """!
+        @brief Read the header of a /Type /ObjStm object stream.
+
+        At most /N pairs and at most one pair per 4 decoded bytes are read.
+        @param s the object Stream.
+        @return tuple (decoded data, /First offset, list of (object number, offset
+        relative to /First)).
+        @exception TypeError or ValueError when /N or /First is not a number.
+        """
+        data = self.decoded(s)
+        n = min(int(self.resolve(s.get('N'))), len(data) // 4)
+        first = int(self.resolve(s.get('First')))
+        lx = Lexer(data)
+        header = []
+        while len(header) < 2 * n and lx.p < first:
+            t = lx.token()
+            if t is None:
+                break
+            header.append(t)
+        pairs = []
+        for i in range(0, len(header) - 1, 2):
+            onum, off = header[i], header[i + 1]
+            if type(onum) is int and type(off) is int:
+                pairs.append((onum, off))
+        return data, first, pairs
 
     def _expand_object_streams(self):
         """!
         @brief Add the objects stored in /Type /ObjStm object streams to the object table.
 
-        An object already defined later in the file than the object stream is kept.
-        Object streams that fail to parse are skipped.
+        Used by the scan. An object already defined later in the file than the object
+        stream is kept. Object streams that fail to parse are recorded with problem().
         """
         for snum, s in list(self.objects.items()):
             if not isinstance(s, Stream) or s.get('Type') != 'ObjStm':
                 continue
             try:
-                data = self.decoded(s)
-                n = min(int(self.resolve(s.get('N'))), len(data) // 4)
-                first = int(self.resolve(s.get('First')))
-                lx = Lexer(data)
-                header = []
-                while len(header) < 2 * n and lx.p < first:
-                    t = lx.token()
-                    if t is None:
-                        break
-                    header.append(t)
-                for i in range(0, len(header) - 1, 2):
-                    onum, off = header[i], header[i + 1]
-                    if type(onum) is not int or type(off) is not int:
-                        continue
-                    spos = self.objpos.get(snum, 0)
+                data, first, pairs = self._objstm_entries(s)
+                spos = self.objpos.get(snum, 0)
+                for onum, off in pairs:
                     if onum in self.objects and self.objpos.get(onum, -1) > spos:
                         continue
                     self.objects[onum] = Lexer(data, first + off).value()
                     self.objpos[onum] = spos
-            except Exception:
-                continue
+                    self.gens.pop(onum, None)
+            except Exception as exc:  # damaged object stream: its objects stay missing
+                problem('malformed', 'object %s: %s' % (s.label(), _one_line(exc)))
+
+    def _outside_objects(self, pos):
+        """!
+        @brief Check that a position is outside every scanned object and comment.
+
+        Objects include their strings and stream data. A % earlier on the same line, at
+        most 4096 bytes back, marks a comment.
+        @param pos byte offset in the file.
+        @return True when pos is in neither.
+        """
+        spans = self._spans
+        lo, hi = 0, len(spans)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if spans[mid][0] <= pos:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo and pos < spans[lo - 1][1]:
+            return False
+        d = self.data
+        low = max(0, pos - 4096)
+        line = max(d.rfind(b'\n', low, pos), d.rfind(b'\r', low, pos), low - 1) + 1
+        return b'%' not in d[line:pos]
 
     def _trailer(self):
         """!
-        @brief Build the trailer dictionary.
+        @brief Build the trailer dictionary for the scan.
 
-        Merges all trailer dictionaries and cross-reference stream dictionaries in file
-        order, later entries overriding earlier ones. When /Root does not resolve to a
-        dictionary, the first /Type /Catalog object is used as root.
+        Merges all trailer dictionaries outside objects and comments, and all
+        cross-reference stream dictionaries, in file order, later entries overriding
+        earlier ones.
         @return the merged trailer dictionary.
         """
         found = []
         for m in _TRAILER_RE.finditer(self.data):
+            if not self._outside_objects(m.start()):
+                continue
             try:
                 t = Lexer(self.data, m.start() + 7).value()
-                if isinstance(t, dict):
-                    found.append((m.start(), t))
-            except Exception:
-                pass
+            except Exception:  # damaged trailer: the other trailers still count
+                continue
+            if isinstance(t, dict):
+                found.append((m.start(), t))
         for num, o in self.objects.items():
             if isinstance(o, Stream) and o.get('Type') == 'XRef':
                 found.append((self.objpos.get(num, 0), o.dict))
@@ -974,24 +1302,63 @@ class Document:
         merged = {}
         for _, t in found:
             merged.update(t)
-        if not isinstance(self.resolve(merged.get('Root')), dict):
-            for num, o in self.objects.items():
-                if isinstance(o, dict) and o.get('Type') == 'Catalog':
-                    merged['Root'] = Ref(num, 0)
-                    break
         return merged
+
+    def _scan_agrees(self):
+        """!
+        @brief Check the scanned objects against the cross-reference sections in the file.
+
+        Sections are found by the xref keyword outside objects and comments, and as
+        /Type /XRef streams; their offsets are not used, so offsets shifted by edits do
+        not matter. Later sections override earlier ones.
+        @return True when at least one section is readable and no object it marks free
+        was found, every in-use object was found and the generation numbers match.
+        """
+        sections = []
+        for m in _XREF_RE.finditer(self.data):
+            if self._outside_objects(m.start()):
+                try:
+                    sections.append((m.start(), self._xref_section(m.start())[0]))
+                except Exception:  # unreadable section: it does not count
+                    continue
+        for num, o in self.objects.items():
+            if isinstance(o, Stream) and o.get('Type') == 'XRef':
+                try:
+                    sections.append((self.objpos.get(num, 0), self._xref_stream_entries(o)))
+                except Exception:  # unreadable section: it does not count
+                    continue
+        if not sections:
+            return False
+        sections.sort(key=lambda x: x[0])
+        latest = {}
+        for _, sec in sections:
+            latest.update(sec)
+        for num, (t, _, b) in latest.items():
+            if num == 0:
+                continue
+            if t == 0 and num in self.objects:
+                return False
+            if t == 1 and (num not in self.objects or self.gens.get(num, 0) != b):
+                return False
+            if t == 2 and num not in self.objects:
+                return False
+        return True
 
     def resolve(self, x):
         """!
         @brief Follow indirect references to the object they name.
         @param x any object, possibly a Ref.
         @return the referenced object, x itself when it is not a Ref, or None for a missing
-        object or a chain longer than 32 references.
+        object, a generation number that differs from the loaded object's, or a chain
+        longer than 32 references.
         """
+        objects, gens = self.objects, self.gens
         for _ in range(32):
             if not isinstance(x, Ref):
                 return x
-            x = self.objects.get(x.num)
+            if x.gen != gens.get(x.num, 0):
+                return None
+            x = objects.get(x.num)
         return None
 
     def decode(self, s):
@@ -1000,7 +1367,9 @@ class Document:
 
         Supports FlateDecode and LZWDecode (with predictors), ASCII85Decode,
         ASCIIHexDecode and RunLengthDecode, also by their abbreviated names.
-        At the first image filter (IMAGE_FILTERS) decoding stops.
+        At the first image filter (IMAGE_FILTERS) decoding stops. After every filter
+        stage the data is cut to MAX_DECODED bytes; reaching that size is recorded with
+        problem().
         @param s the Stream.
         @return tuple (bytes, native image filter name or None). With an image filter the
         bytes are the data still in that filter's encoding.
@@ -1015,6 +1384,7 @@ class Document:
             filters = [filters]
         if not isinstance(parms, list):
             parms = [parms]
+        cut = False
         for i, f in enumerate(filters):
             f = self.resolve(f)
             p = self.resolve(parms[i]) if i < len(parms) else None
@@ -1032,23 +1402,50 @@ class Document:
                 return data, f
             else:
                 raise PDFError('unsupported filter %s' % f)
+            if len(data) >= MAX_DECODED and not cut:
+                cut = True
+                problem(
+                    'limit',
+                    '%s: decoded size reached MAX_DECODED (%s)'
+                    % (s.label(), _size_text(MAX_DECODED)),
+                )
+            if len(data) > MAX_DECODED:
+                data = data[:MAX_DECODED]
         return data, None
 
     def decoded(self, s):
         """!
         @brief Return the decoded bytes of a stream, cached per stream.
+
+        Decoding errors are recorded with problem(): an unsupported filter as
+        'unsupported', damaged data as 'malformed', anything else as 'internal'. Once
+        the cache holds MAX_DOC_DECODED bytes, further streams are decoded on every call
+        instead of being cached.
         @param s the Stream.
         @return the decoded bytes, or b'' when decoding fails or the stream ends in an image
         filter.
         """
         key = id(s)
-        if key not in self._dec:
-            try:
-                data, native = self.decode(s)
-                self._dec[key] = b'' if native else data
-            except Exception:
-                self._dec[key] = b''
-        return self._dec[key]
+        data = self._dec.get(key)
+        if data is not None:
+            return data
+        try:
+            data, native = self.decode(s)
+            if native:
+                data = b''
+        except PDFError as exc:
+            problem('unsupported', '%s: %s' % (s.label(), _one_line(exc)))
+            data = b''
+        except (ValueError, zlib.error) as exc:
+            problem('malformed', '%s: %s' % (s.label(), _one_line(exc)))
+            data = b''
+        except Exception as exc:  # a decoder bug must not end the conversion
+            problem('internal', '%s: %s: %s' % (s.label(), type(exc).__name__, _one_line(exc)))
+            data = b''
+        if self._dec_size + len(data) <= MAX_DOC_DECODED:
+            self._dec[key] = data
+            self._dec_size += len(data)
+        return data
 
     def pages(self):
         """!

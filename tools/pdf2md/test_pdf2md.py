@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 import unittest.mock as mock
 import xml.etree.ElementTree as ET
@@ -372,6 +373,246 @@ class Parsing(Base):
         )
         rc, text = self.md(f)
         self.assertIn('Via gs', text)
+
+
+class ParserStructure(Base):
+    """!
+    @brief Cross-reference chain, trailer search and decoder output limits.
+    """
+
+    @staticmethod
+    def shifted(data):
+        """!
+        @brief Insert 21 bytes into the page tree node of a make_pdf file, so that the
+        cross-reference offsets of the later objects no longer point to them.
+        @param data file bytes
+        @return the edited bytes
+        """
+        return data.replace(b'/Count 1', b'/Count 1 /Pad (offsets shift)')
+
+    def update(self, f, body, xref):
+        """!
+        @brief Append an incremental update with a classic cross-reference table.
+        @param f PDF file written by make_pdf
+        @param body list of (object number, object bytes) to append
+        @param xref list of (object number, 'n' or 'f', generation); 'n' entries take
+               the offset of the object appended with that number
+        @return the new file bytes
+        """
+        data = _readb(f)
+        prev = int(data[data.rfind(b'startxref') + 9 :].split()[0])
+        offs = {}
+        for num, obj in body:
+            offs[num] = len(data)
+            data += b'%d 0 obj\n' % num + obj + b'\nendobj\n'
+        x = len(data)
+        data += b'xref\n0 1\n0000000000 65535 f \n'
+        for num, kind, gen in xref:
+            off = offs[num] if kind == 'n' else 0
+            data += b'%d 1\n%010d %05d %s \n' % (num, off, gen, kind.encode())
+        data += b'trailer\n<< /Size 9 /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n' % (prev, x)
+        _write(f, data)
+        return data
+
+    def test_text_that_shows_trailer_is_not_the_trailer(self):
+        """!
+        @brief Test: "trailer <<" inside a content stream does not mark the file as encrypted,
+        with exact offsets and after an edit that shifts them.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, b'BT /F1 12 Tf 72 700 Td (trailer << /Encrypt 99 0 R >>) Tj ET\n')
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('/Encrypt 99', text)
+        _write(f, self.shifted(_readb(f)))  # offsets now drift: scan
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('/Encrypt 99', text)
+
+    def test_incremental_update_newest_revision_wins(self):
+        """!
+        @brief Test: an update with /Prev replaces the content stream and frees object 6.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, objs=[b'(old six)'])
+        P.PROBLEMS.clear()
+        new = stream(b'BT /F1 12 Tf 72 700 Td (New text) Tj ET')
+        data = self.update(f, [(4, new)], [(4, 'n', 0), (6, 'f', 1)])
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('New text', text)
+        self.assertNotIn('Hello', text)
+        doc = P.Document(data)
+        self.assertIsNone(doc.resolve(P.Ref(6, 0)))
+        self.assertEqual(P.PROBLEMS, {})
+
+    def test_xref_stream_update_with_object_stream(self):
+        """!
+        @brief Test: an update made of a compressed cross-reference stream whose entries
+        point to a new content stream, a free entry and an object in an object stream.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, objs=[b'(old six)'])
+        data = _readb(f)
+        prev = int(data[data.rfind(b'startxref') + 9 :].split()[0])
+        off4 = len(data)
+        data += b'4 0 obj\n' + stream(b'BT /F1 12 Tf 72 700 Td (Streamed) Tj ET') + b'\nendobj\n'
+        packed = b'9 0 (in objstm)'
+        off7 = len(data)
+        data += b'7 0 obj\n' + stream(packed, b'/Type /ObjStm /N 1 /First 4') + b'\nendobj\n'
+        off8 = len(data)
+        rows = [(1, off4, 0), (0, 0, 1), (1, off7, 0), (1, off8, 0), (2, 7, 0)]
+        raw = zlib.compress(
+            b''.join(bytes([a]) + b.to_bytes(4, 'big') + c.to_bytes(2, 'big') for a, b, c in rows)
+        )
+        data += b'8 0 obj\n' + stream(
+            raw,
+            b'/Type /XRef /W [1 4 2] /Index [4 1 6 4] /Size 10 /Root 1 0 R '
+            b'/Filter /FlateDecode /Prev %d' % prev,
+        )
+        data += b'\nendobj\nstartxref\n%d\n%%%%EOF\n' % off8
+        _write(f, data)
+        doc = P.Document(data)
+        self.assertEqual(doc.resolve(P.Ref(9, 0)), b'in objstm')
+        self.assertIsNone(doc.resolve(P.Ref(6, 0)))
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('Streamed', text)
+
+    def test_wrong_generation_resolves_to_null(self):
+        """!
+        @brief Test: a reference whose generation number differs resolves to None, with
+        the cross-reference table and with the scan.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        for data in (_readb(f), self.shifted(_readb(f))):
+            doc = P.Document(data)
+            self.assertIsNone(doc.resolve(P.Ref(5, 1)))
+            self.assertEqual(doc.resolve(P.Ref(5, 0))['BaseFont'], 'Helvetica')
+        _write(f, _readb(f).replace(b'/Contents 4 0 R', b'/Contents 4 1 R'))
+        rc, text = self.md(f)
+        self.assertNotIn('Hello', text)
+
+    def test_scan_fallback_is_recorded_only_when_needed(self):
+        """!
+        @brief Test: shifted offsets with a readable table are not a problem; a missing
+        table, or a free object that the scan still finds, is recorded once.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f)
+        good = _readb(f)
+        _write(f, self.shifted(good))
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual((rc, err), (0, ''))
+        _write(f, good[: good.index(b'xref')] + good[good.index(b'trailer') :])
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        msg = 'malformed: cross-reference table unreadable; objects recovered by scanning'
+        self.assertEqual(err.count(msg), 1)
+        self.assertIn('Hello world', _read(self.path('o.md')))
+        make_pdf(f, objs=[b'(old six)'])
+        data = self.update(f, [(4, stream(HELLO))], [(4, 'n', 0), (6, 'f', 1)])
+        _write(f, self.shifted(data))
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn(msg, err)
+
+    def test_decoded_size_is_capped_after_every_stage(self):
+        """!
+        @brief Test: FlateDecode then ASCII85Decode stays within MAX_DECODED, and the
+        expanding decoders stop at the limit.
+        """
+        old = P.MAX_DECODED
+        P.MAX_DECODED = 1 << 16
+        try:
+            P.PROBLEMS.clear()
+            doc = P.Document(b'%PDF-1.4\n')
+            P.PROBLEMS.clear()
+            s = P.Stream({'Filter': ['FlateDecode', 'ASCII85Decode']}, zlib.compress(b'z' * 70000))
+            s.num, s.gen = 7, 0
+            t = time.time()
+            self.assertEqual(len(doc.decoded(s)), 1 << 16)
+            self.assertEqual(
+                list(P.PROBLEMS),
+                [(None, 'limit', 'stream 7 0 R: decoded size reached MAX_DECODED (65536 bytes)')],
+            )
+            self.assertEqual(len(P._a85(b'z' * 40000)), 1 << 16)
+            self.assertEqual(P._a85(b'87cURD]i,"Ebo80~>'), b'Hello World!')
+            self.assertEqual(len(P._rld(b'\x81a' * 1000)), 1 << 16)
+            parms = {'Predictor': 12, 'Columns': 1000}
+            self.assertEqual(len(P._predict(b'\0' * 300000, parms)), 1 << 16)
+            self.assertLess(time.time() - t, 5)
+        finally:
+            P.MAX_DECODED = old
+
+    def test_decode_errors_are_recorded(self):
+        """!
+        @brief Test: an unsupported filter and damaged ASCII85 data are recorded with
+        the stream's object number instead of being dropped silently.
+        """
+        f = self.path('a.pdf')
+        form = b'/Type /XObject /Subtype /Form /BBox [0 0 612 792] '
+        make_pdf(
+            f,
+            HELLO + b'/X1 Do /X2 Do',
+            [stream(b'xx', form + b'/Filter /Foo'), stream(b'\x7f\x7f', form + b'/Filter /A85')],
+            resources=b'/XObject << /X1 6 0 R /X2 7 0 R >>',
+        )
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual(rc, 3)
+        self.assertIn('unsupported: stream 6 0 R: unsupported filter Foo', err)
+        self.assertIn('malformed: stream 7 0 R:', err)
+
+    def test_decoded_cache_has_a_document_budget(self):
+        """!
+        @brief Test: past MAX_DOC_DECODED, streams are still decoded but not cached.
+        """
+        old = P.MAX_DOC_DECODED
+        P.MAX_DOC_DECODED = 1000
+        try:
+            doc = P.Document(b'%PDF-1.4\n')
+            a = P.Stream({}, b'a' * 800)
+            b = P.Stream({}, b'b' * 800)
+            self.assertEqual(doc.decoded(a), b'a' * 800)
+            self.assertEqual(doc.decoded(b), b'b' * 800)
+            self.assertEqual(doc.decoded(b), b'b' * 800)
+            self.assertEqual(doc._dec_size, 800)
+            self.assertEqual(len(doc._dec), 1)
+        finally:
+            P.MAX_DOC_DECODED = old
+
+    def test_lzw_dictionary_stops_at_4096_entries(self):
+        """!
+        @brief Test: after the dictionary is full, repeated codes add no entries.
+
+        The codes build a chain of entries up to code 4095 and then
+        repeat code 4095 (3839 bytes). A growing dictionary would keep a copy of every repeat.
+        """
+        codes = [65] + list(range(258, 4096)) + [4095] * 3000
+        bits, acc, nb, data, size = 9, 0, 0, bytearray(), 258
+        for i, c in enumerate(codes):
+            acc = (acc << bits) | c
+            nb += bits
+            while nb >= 8:
+                nb -= 8
+                data.append((acc >> nb) & 0xFF)
+            acc &= (1 << nb) - 1
+            if i and size < 4096:
+                size += 1
+            if size + 1 >= (1 << bits) and bits < 12:
+                bits += 1
+        data.append((acc << (8 - nb)) & 0xFF)
+        t = time.time()
+        tracemalloc.start()
+        try:
+            out = P._lzw(bytes(data), None)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(out, b'A' * (3839 * 3840 // 2 + 3000 * 3839))
+        self.assertLess(peak - 2 * len(out), 12 << 20)  # the full dictionary is 7.4 MB
+        self.assertLess(time.time() - t, 5)
 
 
 class Layout(Base):
