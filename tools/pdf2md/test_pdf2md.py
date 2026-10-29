@@ -19,6 +19,7 @@ import importlib.util
 import io
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1072,8 +1073,19 @@ class InlineImages(Base):
         make_pdf(f, HELLO + b'q 10 0 0 10 72 600 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q\n')
         rc, out, err = self.cli('-q', f, '-o', self.path('o.md'))
         self.assertEqual(rc, 3)
-        self.assertIn('page 1: unsupported: inline image (BI/ID/EI) not exported', err)
+        self.assertIn('page 1: unsupported: 1 inline image(s) (BI/ID/EI) not exported', err)
         self.assertIn('Hello world', _read(self.path('o.md')))
+        rc, _, err = self.cli('-q', '--no-figures', f, '-o', self.path('o.md'))
+        self.assertEqual((rc, err), (0, ''))
+
+    def test_tiny_inline_image_is_not_reported(self):
+        """!
+        @brief Test: an inline image placed under 1 point is ignored like a tiny XObject.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'q 0.5 0 0 0.5 72 600 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q\n')
+        rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+        self.assertEqual((rc, err), (0, ''))
 
 
 class CommandLine(Base):
@@ -1868,6 +1880,194 @@ class OutputSafety(Base):
         self.assertEqual((rc, err), (0, ''))
         rc, _, err = self.cli('-q', '--split-pages', f, '-o', self.path('o'))
         self.assertEqual((rc, err), (0, ''))
+
+
+class ReviewRegressions(Base):
+    """!
+    @brief Cases from the review of the merged fixes: hybrid files, cross-reference
+    stream size, numbered band figures, per-page code count, large boxes, ISO-2022 CMaps.
+    """
+
+    def pages_pdf(self, contents, media=b'0 0 612 792'):
+        """!
+        @brief Write a PDF with one page per content stream and a Helvetica font F1.
+        @param contents list of content stream bytes
+        @param media MediaBox numbers
+        @return path of the PDF
+        """
+        n = len(contents)
+        kids = b' '.join(b'%d 0 R' % (3 + 2 * i) for i in range(n))
+        objs = [
+            b'<< /Type /Catalog /Pages 2 0 R >>',
+            b'<< /Type /Pages /Kids [' + kids + b'] /Count %d >>' % n,
+        ]
+        for i, c in enumerate(contents):
+            objs.append(
+                b'<< /Type /Page /Parent 2 0 R /MediaBox [' + media + b'] /Contents %d 0 R '
+                b'/Resources << /Font << /F1 %d 0 R >> >> >>' % (4 + 2 * i, 3 + 2 * n)
+            )
+            objs.append(stream(c))
+        objs.append(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+        out = b'%PDF-1.4\n'
+        offs = []
+        for i, o in enumerate(objs):
+            offs.append(len(out))
+            out += b'%d 0 obj\n' % (i + 1) + o + b'\nendobj\n'
+        x = len(out)
+        out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(objs) + 1)
+        out += b''.join(b'%010d 00000 n \n' % o for o in offs)
+        out += b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (
+            len(objs) + 1,
+            x,
+        )
+        f = self.path('pages.pdf')
+        _write(f, out)
+        return f
+
+    def test_hybrid_table_marking_compressed_objects_free(self):
+        """!
+        @brief Test: an /XRefStm entry replaces a free entry of the same section's table.
+        """
+        out = b'%PDF-1.5\n'
+        offs = {}
+
+        def obj(n, body):
+            offs[n] = len(out)
+            return out + b'%d 0 obj\n' % n + body + b'\nendobj\n'
+
+        content = b'BT /F1 12 Tf 72 700 Td (Hello hybrid) Tj ET'
+        out = obj(1, b'<< /Type /Catalog /Pages 2 0 R >>')
+        out = obj(2, b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>')
+        out = obj(4, stream(content))
+        o3 = (
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R '
+            b'/Resources << /Font << /F1 5 0 R >> >> >>'
+        )
+        o5 = b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+        head = b'3 0 5 %d ' % (len(o3) + 1)
+        out = obj(6, stream(head + o3 + b' ' + o5, b'/Type /ObjStm /N 2 /First %d' % len(head)))
+        rows = b''
+        for n in range(7):
+            if n in (3, 5):
+                rows += struct.pack('>BIH', 2, 6, 0 if n == 3 else 1)
+            elif n in offs:
+                rows += struct.pack('>BIH', 1, offs[n], 0)
+            else:
+                rows += struct.pack('>BIH', 0, 0, 65535)
+        xs = len(out)
+        rows += struct.pack('>BIH', 1, xs, 0)
+        out = obj(7, stream(rows, b'/Type /XRef /W [1 4 2] /Size 8'))
+        x = len(out)
+        out += b'xref\n0 8\n0000000003 65535 f \n'
+        for n in range(1, 8):
+            if n in (3, 5):
+                out += b'%010d 65535 f \n' % (5 if n == 3 else 0)
+            else:
+                out += b'%010d 00000 n \n' % offs[n]
+        out += b'trailer\n<< /Size 8 /Root 1 0 R /XRefStm %d >>\nstartxref\n%d\n%%%%EOF\n' % (
+            xs,
+            x,
+        )
+        f = self.path('h.pdf')
+        _write(f, out)
+        rc, text = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertIn('Hello hybrid', text)
+
+    def test_cross_reference_stream_entries_are_bounded(self):
+        """!
+        @brief Test: a cross-reference stream of 16 MiB compressed zeros is read quickly.
+        """
+        comp = zlib.compress(b'\0' * (16 << 20), 9)
+        body = [
+            b'<< /Type /Catalog /Pages 2 0 R >>',
+            b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R '
+            b'/Resources << /Font << /F1 5 0 R >> >> >>',
+            stream(HELLO),
+            b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        ]
+        out = b'%PDF-1.5\n'
+        for i, o in enumerate(body):
+            out += b'%d 0 obj\n' % (i + 1) + o + b'\nendobj\n'
+        x = len(out)
+        out += b'6 0 obj\n' + stream(
+            comp, b'/Type /XRef /W [0 1 0] /Size %d /Root 1 0 R /Filter /FlateDecode' % (16 << 20)
+        )
+        out += b'\nendobj\nstartxref\n%d\n%%%%EOF\n' % x
+        f = self.path('x.pdf')
+        _write(f, out)
+        t = time.time()
+        rc, text = self.md(f)
+        self.assertIn(rc, (0, 3))
+        self.assertIn('Hello world', text)
+        self.assertLess(time.time() - t, 5)
+
+    def test_band_figure_with_page_number_is_dropped(self):
+        """!
+        @brief Test: a footer badge whose text is the page number repeats on every page.
+        """
+        pages = []
+        for n in range(1, 7):
+            body = b''.join(
+                b'BT /F1 11 Tf 72 %d Td (Body line %d on page %d) Tj ET\n' % (700 - 14 * i, i, n)
+                for i in range(20)
+            )
+            # filled circle of radius 14 pt at (306, 40), drawn with four Bezier curves
+            badge = b'0.2 0.3 0.8 rg 320 40 m 320 47.7 313.7 54 306 54 c 298.3 54 292 47.7 '
+            badge += b'292 40 c 292 32.3 298.3 26 306 26 c 313.7 26 320 32.3 320 40 c f '
+            badge += b'1 g BT /F1 9 Tf 303 37 Td (%d) Tj ET 0 g\n' % n
+            pages.append(body + badge)
+        rc, text = self.md(self.pages_pdf(pages))
+        self.assertEqual(rc, 0)
+        self.assertIn('Body line 3 on page 6', text)
+        self.assertNotIn('![', text)
+
+    def test_codes_without_characters_count_per_page(self):
+        """!
+        @brief Test: codes that produce no Char (size under 1 pt) count toward MAX_PAGE_CODES.
+        """
+        f = self.path('a.pdf')
+        make_pdf(f, HELLO + b'BT /F1 0.1 Tf 72 600 Td (' + b'x' * 5000 + b') Tj ET\n')
+        old = P.MAX_PAGE_CODES
+        P.MAX_PAGE_CODES = 1000
+        try:
+            P.analyze(f)
+        finally:
+            P.MAX_PAGE_CODES = old
+        self.assertIn((1, 'limit', 'page reached MAX_PAGE_CODES (1000 codes)'), list(P.PROBLEMS))
+
+    def test_many_large_boxes_are_fast(self):
+        """!
+        @brief Test: 8000 lines of 100,000 pt each on a wide page cluster in under 5 s.
+        """
+        c = b''.join(b'%d 0 m %d 100000 l S\n' % (i * 100, i * 100) for i in range(8000))
+        f = self.pages_pdf([HELLO + c], media=b'0 0 10000000 100000')
+        t = time.time()
+        rc, _ = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertLess(time.time() - t, 5)
+
+    def test_iso2022_cmaps_are_two_byte(self):
+        """!
+        @brief Test: /78-H, /GBT-H and /KSC-Johab-H have a known code space, no problem.
+        """
+        for name in (b'78-H', b'GBT-H', b'KSC-Johab-H'):
+            f = self.path('a.pdf')
+            make_pdf(
+                f,
+                b'BT /F2 12 Tf 72 700 Td <0041> Tj ET ' + HELLO,
+                [
+                    b'<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /'
+                    + name
+                    + b' /DescendantFonts [7 0 R] >>',
+                    b'<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X >>',
+                ],
+            )
+            data = _readb(f).replace(b'/Font << /F1 5 0 R >>', b'/Font << /F1 5 0 R /F2 6 0 R >>')
+            _write(f, data)
+            rc, _, err = self.cli('-q', f, '-o', self.path('o.md'))
+            self.assertEqual((rc, err), (0, ''), name)
 
 
 if __name__ == '__main__':

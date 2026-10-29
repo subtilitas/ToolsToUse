@@ -20,7 +20,7 @@ Child processes started by the tests are included.
 <!-- coverage:start -->
 | Tool | Coverage |
 | --- | ---: |
-| [pdf2md](tools/pdf2md/README.md) | 72 % |
+| [pdf2md](tools/pdf2md/README.md) | 73 % |
 <!-- coverage:end -->
 
 ## Layout

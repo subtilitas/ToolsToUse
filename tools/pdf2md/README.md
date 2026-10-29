@@ -37,7 +37,8 @@ python pdf2md.py input.pdf --split-pages --flat   # page files without folders
 
 An output path that is the input file, or a symbolic or hard link to it, is rejected with exit code 1.
 The Markdown file, page files and `index.md` are checked before any file is written; figure files when they are written.
-Every output file is written to a temporary file in the same directory and moved into place with `os.replace()`.
+Every output file is written to a temporary file in the same directory (`.~` plus 8 hex digits plus `.tmp`) and moved into place with `os.replace()`.
+On Windows, `os.replace()` is retried up to 5 times within about 1.5 s when a virus scanner or indexer holds the file.
 A failed run keeps an existing file unchanged, and a symbolic link at an output path is replaced, not written through.
 
 ## Exit codes
@@ -90,10 +91,11 @@ At most 1000 distinct problems (`MAX_PROBLEMS`) are listed.
 - Pages with `/Rotate` are read as displayed.
   When most text on a rotated page is not upright as displayed, the page is read unrotated.
 - Lines in the top or bottom 10 % of the page box that repeat (digits ignored) on at least 50 % of the pages, minimum 3 pages, are page headers or footers and are dropped.
-- A figure is dropped only when it lies wholly inside one of these bands and the same figure (same rounded position, same shapes and image data, same text) occurs there on that many pages.
+- A figure is dropped only when it lies wholly inside one of these bands and the same figure (same rounded position, same shapes and image data, same text with digits ignored) occurs there on that many pages.
   Figures elsewhere, including full-page scans, are kept.
 - Objects are read through the cross-reference chain from the last `startxref` (tables, cross-reference streams, `/XRefStm`, `/Prev`).
   The newest revision wins, free entries are ignored, and a reference with a different generation number is null.
+  In a hybrid file, an `/XRefStm` entry replaces a free entry of the same section's table.
   When the chain is unreadable, objects are recovered by scanning the file; this is reported as a problem unless only the byte offsets have shifted.
 
 ### One file per page (`--split-pages`)
@@ -136,7 +138,9 @@ Output of a file that hits one is incomplete.
 | Form XObject runs per page (`MAX_FORM_RUNS`) | 2000 |
 | Form XObject nesting | 12 levels |
 | Characters per page (`MAX_PAGE_CHARS`) | 1,000,000 |
-| Grid cells per box in figure clustering (`MAX_GRID_CELLS`) | 1024 cells of at least 64 x 64 pt; larger boxes are compared with all boxes directly |
+| Entries per cross-reference stream (`MAX_XREF_ENTRIES`) | 8,388,607, and at most `/Size` and the file length in bytes |
+| Character codes shown per page (`MAX_PAGE_CODES`) | 2,000,000, including codes that produce no character |
+| Grid cells per box in figure clustering (`MAX_GRID_CELLS`, `GRID_LEVELS`) | 1024 cells on the lowest of 8 grid levels (cells of 64 pt x 32^k) where the box fits |
 | Entries per font table (`MAX_FONT_ENTRIES`) | 2^20, for ToUnicode and encoding CMap codes, `W` and `Widths`, `Differences`, `CIDToGIDMap` |
 | ToUnicode text per font (`MAX_FONT_TEXT`) | 2^22 characters, counted over every insertion |
 | One ToUnicode destination (`MAX_CMAP_DEST`) | 64 characters |
@@ -159,8 +163,8 @@ Output of a file that hits one is incomplete.
 - Text in fonts without a ToUnicode map is decoded from the font encoding, the built-in encoding of an embedded Type 1 program, the Symbol, ZapfDingbats or Wingdings tables, or the cmap table of an embedded TrueType program (character identifier (CID) fonts).
   Fonts that name glyphs only by number (`g18`, `g152`) and have none of these decode to wrong characters.
   Unmappable CID glyphs are written as U+FFFD.
-- Predefined CMaps of composite fonts are read with the code space of their family (Identity, ISO-2022, UCS2, UTF16, UTF32, RKSJ, EUC, GBK, GBK2K, Big Five, UHC, one-byte CMaps).
-  The code-space tables are family approximations, not the Adobe CMap files.
+- Predefined CMaps of composite fonts are read with the code space of their family (Identity, ISO-2022 including 78 and GBT, UCS2, UTF16, UTF32, RKSJ, EUC, GBK, GBK2K, Big Five, UHC, Johab, one-byte CMaps).
+  The code-space tables are family approximations, not the Adobe CMap files; Johab uses the UHC ranges.
   The predefined CID-to-Unicode mappings are not included, so text comes from ToUnicode or the embedded TrueType cmap.
   UTF8 and other unknown CMap names use the ToUnicode code space, or two-byte codes with an `unsupported` problem when there is none.
 - Vertical writing mode (Identity-V) is read as horizontal text.
@@ -170,6 +174,8 @@ Output of a file that hits one is incomplete.
   Word gaps in that text can be misdetected, and its SVG text is not width-fitted.
 - Rotated text outside figures is dropped.
 - Images with CCITTFax or JBIG2 encoding, inline images (`BI`/`ID`/`EI`), and Indexed images with a `/Decode` other than the default or `[2^bits-1 0]` are not exported and are reported.
+  Inline images are reported only when figures are exported (no `--no-figures`), outside annotation appearances, and when placed at 1 pt or more.
+  Inline images in a header or footer band are reported too.
 - Soft-mask transparency (`/SMask`) is ignored without a report. The image is exported opaque.
 - Lab colors and images are converted to sRGB without chromatic adaptation. Colors with a D50 white point are slightly shifted.
 - SVG text uses generic font families, stretched to the original run width.
@@ -179,7 +185,7 @@ Output of a file that hits one is incomplete.
 
 ## Tests
 
-`test_pdf2md.py` holds 83 regression tests.
+`test_pdf2md.py` holds 90 regression tests.
 Each test builds the PDF it needs in a temporary directory.
 They need no network access.
 Tests that render Markdown with pandoc are skipped when pandoc is not installed.

@@ -45,16 +45,19 @@ python pdf2md.py input.pdf --split-pages --flat  # page files without folders
   on at least 50 % of the pages, minimum 3 pages, are page headers or footers
   and are dropped. A figure is dropped only when it lies wholly inside one of
   these bands and the same figure (same rounded position, same shapes and image
-  data, same text) occurs there on that many pages. Figures elsewhere,
+  data, same text with digits ignored) occurs there on that many pages. Figures elsewhere,
   including full-page scans, are kept.
 - Objects are read through the cross-reference chain from the last startxref
   (tables, cross-reference streams, /XRefStm, /Prev). The newest revision wins,
   free entries are ignored, and a reference with a different generation number
-  is null. When the chain is unreadable, objects are recovered by scanning the
+  is null. In a hybrid file, an /XRefStm entry replaces a free entry of the same
+  section's table. When the chain is unreadable, objects are recovered by scanning the
   file; this is reported as a problem unless only the byte offsets have shifted.
-- Output files are written to a temporary file in the same directory and moved
-  into place with os.replace(). A failed run keeps an existing file unchanged,
-  and a symbolic link at an output path is replaced, not written through.
+- Output files are written to a temporary file (.~ plus 8 hex digits plus .tmp)
+  in the same directory and moved into place with os.replace(), retried up to 5
+  times within about 1.5 s on Windows when the file is locked. A failed run
+  keeps an existing file unchanged, and a symbolic link at an output path is
+  replaced, not written through.
 
 @par One file per page (--split-pages)
 - Each page becomes page_NNNN.md. index.md lists the contents with links.
@@ -107,9 +110,13 @@ hits one is incomplete.
 - One page: MAX_PAGE_OPS = 5,000,000 content stream operators,
   MAX_FORM_RUNS = 2000 Form XObject runs, Form XObjects nested at most 12
   levels deep, and MAX_PAGE_CHARS = 1,000,000 characters.
-- Figure clustering: a box that would occupy more than MAX_GRID_CELLS = 1024
-  grid cells (cells of at least 64 x 64 pt) is compared with all other boxes
-  directly instead of through the grid.
+- One cross-reference stream: at most min(/Size, file length in bytes,
+  MAX_XREF_ENTRIES = 8,388,607) entries.
+- One page: MAX_PAGE_CODES = 2,000,000 character codes shown, including codes
+  that produce no character.
+- Figure clustering: GRID_LEVELS = 8 grid levels with cells of 64 pt x 32^k;
+  each box goes into the lowest level where it occupies at most
+  MAX_GRID_CELLS = 1024 cells.
 - One font: MAX_FONT_ENTRIES = 2^20 entries in each table (ToUnicode and
   encoding CMap codes, W and Widths, Differences, CIDToGIDMap glyphs),
   MAX_FONT_TEXT = 2^22 characters of ToUnicode text counted over every
@@ -146,9 +153,9 @@ definition. Code blocks use a fence longer than any backtick run inside.
   (g18, g152) and have none of these decode to wrong characters. Unmappable
   CID glyphs are written as U+FFFD.
 - Predefined CMaps of composite fonts are read with the code space of their
-  family (Identity, ISO-2022, UCS2, UTF16, UTF32, RKSJ, EUC, GBK, GBK2K, Big
-  Five, UHC, one-byte CMaps). The code-space tables are family approximations,
-  not the Adobe CMap files. The predefined CID-to-Unicode mappings are not
+  family (Identity, ISO-2022 including 78 and GBT, UCS2, UTF16, UTF32, RKSJ,
+  EUC, GBK, GBK2K, Big Five, UHC, Johab, one-byte CMaps). The code-space tables
+  are family approximations, not the Adobe CMap files; Johab uses the UHC ranges. The predefined CID-to-Unicode mappings are not
   included, so text comes from ToUnicode or the embedded TrueType cmap. UTF8 and
   other unknown CMap names use the ToUnicode code space, or two-byte codes with
   an unsupported problem when there is none.
@@ -161,7 +168,9 @@ definition. Code blocks use a fence longer than any backtick run inside.
 - Rotated text outside figures is dropped.
 - Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI), and
   Indexed images with a /Decode other than the default or [2^bits-1 0] are not
-  exported and are reported. Soft-mask transparency (/SMask) is ignored without
+  exported and are reported. Inline images are reported only when figures are
+  exported (no --no-figures), outside annotation appearances, and when placed at
+  1 pt or more; inline images in a header or footer band are reported too. Soft-mask transparency (/SMask) is ignored without
   a report; the image is exported opaque. Lab colors and images are converted
   to sRGB without chromatic adaptation, so colors with a D50 white point are
   slightly shifted.
@@ -178,6 +187,7 @@ import os
 import re
 import struct
 import sys
+import time
 import unicodedata
 import zlib
 from collections import Counter
@@ -247,11 +257,20 @@ MAX_PAGE_OPS = 5000000
 ##
 ## A dense text page holds about 10,000. Further glyphs are not collected.
 MAX_PAGE_CHARS = 1000000
+## @brief Upper limit for character codes shown on one page (2,000,000), counting codes
+## that produce no Char (empty text or a size under 1 point). Further codes are skipped.
+MAX_PAGE_CODES = 2000000
 ## @brief Upper limit for grid cells that one box may occupy while clustering: 1024 cells.
 ##
-## A cell is at least 64 x 64 points. Larger boxes are compared with every other box
-## directly instead of being entered into the grid.
+## A level-0 cell is at least 64 x 64 points. A larger box goes into a coarser grid
+## level (see _merge_pass).
 MAX_GRID_CELLS = 1024
+## @brief Upper limit for the entries read from one cross-reference stream (8,388,607,
+## the largest object number PDF 1.7 allows); /Size and the file length bound it too.
+MAX_XREF_ENTRIES = 8388607
+## @brief Number of grid levels in figure clustering (cells of 64 pt x 32^k for level k
+## = 0..7, up to about 2.2e12 pt); boxes larger than that are compared with every box.
+GRID_LEVELS = 8
 ## @brief Upper limit for distinct entries kept in PROBLEMS; further ones are only counted.
 MAX_PROBLEMS = 1000
 ## @brief Problems that made the output of the running conversion incomplete.
@@ -1061,6 +1080,8 @@ class Document:
         @brief Read the entries of a /Type /XRef cross-reference stream.
 
         Entries of a type other than 0, 1 and 2 are returned too; they stand for null.
+        At most min(/Size, file length in bytes, MAX_XREF_ENTRIES) entries are read, and
+        object numbers at or above that bound are skipped.
         @param s the cross-reference Stream.
         @return list of (object number, (type, field 2, field 3)). Type 0 is free, type 1
         is (1, offset, generation) and type 2 is (2, object stream number, index).
@@ -1080,13 +1101,17 @@ class Document:
         w0, w1, w2 = w
         rl = w0 + w1 + w2
         fb = int.from_bytes
+        size = s.get('Size')
+        bound = min(size if type(size) is int else 0, len(self.data), MAX_XREF_ENTRIES)
         out = []
         p = 0
         for i in range(0, len(index) - 1, 2):
             first, count = index[i], index[i + 1]
             if type(first) is not int or type(count) is not int or first < 0:
                 raise PDFError('invalid /Index')
-            count = min(count, (len(data) - p) // rl)
+            if len(out) >= bound or first >= bound:
+                break
+            count = min(count, (len(data) - p) // rl, bound - first, bound - len(out))
             for k in range(count):
                 t = fb(data[p : p + w0], 'big') if w0 else 1
                 f2 = fb(data[p + w0 : p + w0 + w1], 'big')
@@ -1146,7 +1171,9 @@ class Document:
         @brief Load the objects named by the cross-reference chain from the last startxref.
 
         For each object number the newest entry wins: a section's table entries, then its
-        /XRefStm stream, then the /Prev sections. Type 1 entries are parsed at their
+        /XRefStm stream, then the /Prev sections. Within one section, an /XRefStm entry
+        replaces a free table entry, since hybrid files list objects that are stored in
+        object streams as free in the table. Type 1 entries are parsed at their
         offset, type 2 entries are read from their object stream. Free and unknown entries
         are not loaded.
         @return the merged trailer dictionary, or None when there is no startxref or no
@@ -1165,14 +1192,17 @@ class Document:
         while pos is not None and pos not in seen:
             seen.add(pos)
             sec, trailer = self._xref_section(pos)
-            for num, ent in sec:
-                entries.setdefault(num, ent)
-            trailers.append(trailer)
+            own = dict(sec)
             hybrid = trailer.get('XRefStm')
             if type(hybrid) is int and 'W' not in trailer and hybrid not in seen:
                 seen.add(hybrid)
                 for num, ent in self._xref_section(hybrid)[0]:
-                    entries.setdefault(num, ent)
+                    # a hybrid table lists objects in object streams as free
+                    if own.get(num, (0,))[0] == 0:
+                        own[num] = ent
+            for num, ent in own.items():
+                entries.setdefault(num, ent)
+            trailers.append(trailer)
             prev = trailer.get('Prev')
             pos = prev if type(prev) is int else None
         merged = {}
@@ -1209,6 +1239,8 @@ class Document:
                 if onum in offs:
                     self.objects[onum] = Lexer(data, first + offs[onum]).value()
                     self.objpos[onum] = self.objpos[snum]
+        if packed:
+            self._fix_lengths(pending)  # /Length values stored in object streams
         return merged
 
     def _scan(self):
@@ -1387,7 +1419,10 @@ class Document:
         sections.sort(key=lambda x: x[0])
         latest = {}
         for _, sec in sections:
-            latest.update(sec)
+            for num, ent in sec:
+                # a hybrid table lists objects in object streams as free
+                if ent[0] != 0 or latest.get(num, (0,))[0] != 2:
+                    latest[num] = ent
         for num, (t, _, b) in latest.items():
             if num == 0:
                 continue
@@ -2406,10 +2441,11 @@ def _predefined_codespace(name):
     """!
     @brief Return the code space ranges of a predefined CMap name.
 
-    Two bytes: Identity, the ISO-2022 CMaps (H, V, Ext, Add, NWP, KSC, GB, CNS1, CNS2)
-    and the Unicode UCS2 and UTF16 CMaps. Four bytes: the UTF32 CMaps. One byte:
-    Hankaku, Hiragana, Katakana, Roman and WP-Symbol. Mixed widths: RKSJ (Shift-JIS),
-    GBK2K, GBK, Big Five (B5) and UHC CMaps, then the other EUC CMaps.
+    Two bytes: Identity, the ISO-2022 CMaps (H, V, 78, Ext, Add, NWP, KSC, GB, GBT,
+    CNS1, CNS2) and the Unicode UCS2 and UTF16 CMaps. Four bytes: the UTF32 CMaps.
+    One byte: Hankaku, Hiragana, Katakana, Roman and WP-Symbol. Mixed widths: RKSJ
+    (Shift-JIS), GBK2K, GBK, Big Five (B5), UHC and Johab CMaps (Johab with the UHC
+    ranges as an approximation), then the other EUC CMaps.
     @param name CMap name, e.g. '90ms-RKSJ-H'
     @return list of (byte count, low code, high code), or None for an unknown name
     """
@@ -2418,11 +2454,13 @@ def _predefined_codespace(name):
         'Identity',
         'H',
         'V',
+        '78',
         'Ext',
         'Add',
         'NWP',
         'KSC',
         'GB',
+        'GBT',
         'CNS1',
         'CNS2',
     ):
@@ -2435,7 +2473,7 @@ def _predefined_codespace(name):
         return _CS_RKSJ
     if 'GBK2K' in name:
         return _CS_GBK2K
-    if re.search(r'GBK|B5|UHC', name):
+    if re.search(r'GBK|B5|UHC|Johab', name):
         return _CS_LEAD81
     if 'EUC' in name:
         return _CS_EUC
@@ -3343,6 +3381,10 @@ class PageContent:
         self.form_runs = 0
         ## content stream operators executed so far on this page (limit MAX_PAGE_OPS)
         self.op_count = 0
+        ## character codes shown so far on this page (limit MAX_PAGE_CODES)
+        self.code_count = 0
+        ## inline images (BI/ID/EI) placed at 1 point or more while shapes are collected
+        self.inline_images = 0
         ## True while annotation appearances run; then only text is collected
         self.no_shapes = False
 
@@ -3576,7 +3618,12 @@ class PageContent:
                     self._do(res, ops[-1], gs, depth)
                 elif op == 'BI':
                     self._skip_inline_image(lx)
-                    problem('unsupported', 'inline image (BI/ID/EI) not exported')
+                    m = gs.ctm
+                    if (
+                        not self.no_shapes
+                        and min(math.hypot(m[0], m[1]), math.hypot(m[2], m[3])) >= 1
+                    ):
+                        self.inline_images += 1
             except Exception as exc:
                 problem('internal', 'content operator %s: %s' % (op[:16], self._exc_text(exc)))
             ops = []
@@ -3814,8 +3861,9 @@ class PageContent:
         applies only to the single-byte code 32.
         Codes with empty text or a scaled size under 1 point produce no Char but still
         advance. A Type 3 fmat changes the glyph orientation, not the origin.
-        Once the page holds MAX_PAGE_CHARS characters, the rest of the string is not
-        collected, the text matrix is returned as advanced so far and the limit is
+        Once the page holds MAX_PAGE_CHARS characters, or MAX_PAGE_CODES codes have been
+        shown on the page (also codes that produce no Char), the rest of the string is
+        not collected, the text matrix is returned as advanced so far and the limit is
         recorded with problem().
         @param gs current graphics state
         @param tm current text matrix
@@ -3832,6 +3880,10 @@ class PageContent:
             if room <= 0:
                 problem('limit', 'page reached MAX_PAGE_CHARS (%d characters)' % MAX_PAGE_CHARS)
                 return tm
+            if self.code_count >= MAX_PAGE_CODES:
+                problem('limit', 'page reached MAX_PAGE_CODES (%d codes)' % MAX_PAGE_CODES)
+                return tm
+            self.code_count += 1
             m = mmul(tm, gs.ctm)
             ox, oy = apply(m, 0, gs.rise)
             if fmat:
@@ -3910,17 +3962,19 @@ def _merge_pass(groups, gap):
     """!
     @brief Merge every pair of groups whose boxes overlap within gap (one pass).
 
-    Pairs are found through a grid with cells of max(64, 4 * gap) points; connected
-    groups are joined with a union-find structure. A box that would occupy more than
-    MAX_GRID_CELLS cells is not entered into the grid but compared with every other
-    group, so the work stays at most proportional to (large boxes x all boxes). A merged
-    box can reach further groups, so cluster() repeats the pass until the count stays
-    the same.
+    Pairs are found through grids: level k has cells of max(64, 4 * gap) * 32^k
+    points. Each box goes into the lowest level where it occupies at most
+    MAX_GRID_CELLS cells, and is checked against the boxes in the cells it touches on
+    its own level and on every coarser level. Every overlapping pair is found once a
+    box of the pair checks the level of the other. Boxes with coordinates that are not
+    finite, or that need more than GRID_LEVELS levels, are compared with every group.
+    Connected groups are joined with a union-find structure. A merged box can reach
+    further groups, so cluster() repeats the pass until the count stays the same.
     @param groups list of [bbox list, member list, index of the last member in items]
     @param gap merge distance in points
     @return list of merged groups in the same form
     """
-    size = max(64.0, 4.0 * gap)
+    base = max(64.0, 4.0 * gap)
     parent = list(range(len(groups)))
 
     def find(i):
@@ -3935,28 +3989,46 @@ def _merge_pass(groups, gap):
             if a != b:
                 parent[max(a, b)] = min(a, b)
 
-    grid = {}
-    large = []  # groups that would occupy more than MAX_GRID_CELLS cells
-    for i, (bb, _, _) in enumerate(groups):
+    def cells(bb, level):
+        size = base * 32.0**level
         cx0, cx1 = (bb[0] - gap) // size, (bb[2] + gap) // size
         cy0, cy1 = (bb[1] - gap) // size, (bb[3] + gap) // size
-        # also true for NaN and infinite coordinates, which int() would reject
-        if not (cx1 - cx0 + 1) * (cy1 - cy0 + 1) <= MAX_GRID_CELLS:
-            for j in range(i):
+        return cx0, cx1, cy0, cy1
+
+    grids = [{} for _ in range(GRID_LEVELS)]
+    placed = []  # (index, level)
+    rest = []  # groups that fit no level
+    for i, (bb, _, _) in enumerate(groups):
+        for level in range(GRID_LEVELS):
+            cx0, cx1, cy0, cy1 = cells(bb, level)
+            # also false for NaN and infinite coordinates, which int() would reject
+            if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) <= MAX_GRID_CELLS:
+                grid = grids[level]
+                for cx in range(int(cx0), int(cx1) + 1):
+                    for cy in range(int(cy0), int(cy1) + 1):
+                        grid.setdefault((cx, cy), []).append(i)
+                placed.append((i, level))
+                break
+        else:
+            rest.append(i)
+    for i, own in placed:
+        bb = groups[i][0]
+        seen = {i}
+        for level in range(own, GRID_LEVELS):
+            grid = grids[level]
+            if not grid:
+                continue
+            cx0, cx1, cy0, cy1 = cells(bb, level)
+            for cx in range(int(cx0), int(cx1) + 1):
+                for cy in range(int(cy0), int(cy1) + 1):
+                    for j in grid.get((cx, cy), ()):
+                        if j not in seen:
+                            seen.add(j)
+                            join(i, j)
+    for i in rest:
+        for j in range(len(groups)):
+            if j != i:
                 join(i, j)
-            large.append(i)
-            continue
-        for j in large:
-            join(i, j)
-        seen = set()
-        for cx in range(int(cx0), int(cx1) + 1):
-            for cy in range(int(cy0), int(cy1) + 1):
-                cell = grid.setdefault((cx, cy), [])
-                for j in cell:
-                    if j not in seen:
-                        seen.add(j)
-                        join(i, j)
-                cell.append(i)
     out = {}
     for i, (bb, members, last) in enumerate(groups):
         root = find(i)
@@ -3999,7 +4071,8 @@ class Region:
         @brief Return a key that identifies the same figure repeated at the same place.
 
         The key holds the bbox rounded to whole points, the shape count, one entry per
-        shape and the text of the characters in the region. An image entry is the
+        shape and the lower-case text of the characters in the region with each digit
+        run replaced by #, so page numbers inside a header or footer figure match. An image entry is the
         length and CRC-32 of the raw image stream bytes, so equal images match even
         when stored as separate objects. A path entry lists its segments with the
         coordinates rounded to whole points.
@@ -4021,7 +4094,7 @@ class Region:
         return (
             (round(b[0]), round(b[1]), round(b[2]), round(b[3]), len(self.shapes)),
             tuple(content),
-            ''.join(c.text for c in self.chars),
+            re.sub(r'\d+', '#', ''.join(c.text for c in self.chars).lower()),
         )
 
 
@@ -6248,6 +6321,11 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
                     pc, rbox = alt, box
             box = rbox
             layouts.append(layout_page(i, pc, box, figures))
+            if figures and pc.inline_images:
+                problem(
+                    'unsupported',
+                    '%d inline image(s) (BI/ID/EI) not exported' % pc.inline_images,
+                )
         except Exception as exc:
             problem('internal', 'page skipped (%s: %s)' % (type(exc).__name__, exc))
             layouts.append(PageLayout(i, box, [], []))
@@ -6322,20 +6400,23 @@ def _write_atomic(path, data):
     """!
     @brief Write a file through a temporary file in the same directory and os.replace.
 
-    The temporary file name is a dot, the target name cut to 32 characters, a dot, 12
-    random hex digits and .tmp. It is created exclusively with mode 0666 minus the
-    umask; it takes the mode of an existing regular file at path. os.replace then swaps it in; a symbolic link at path is
-    replaced by the file, its target is not written. When anything fails, the temporary
-    file is removed and an existing file at path keeps its content.
+    The temporary file name is .~, 8 random hex digits and .tmp (14 characters), so
+    the path stays short on Windows. It is created exclusively with mode 0666 minus
+    the umask; it takes the mode of an existing regular file at path. os.replace then
+    swaps it in; a symbolic link at path is replaced by the file, its target is not
+    written. On Windows, os.replace is retried up to 5 times within about 1.5 s on
+    PermissionError, which a virus scanner or indexer holding the file causes. When
+    anything fails, the temporary file is made writable and removed, and an existing
+    file at path keeps its content.
 
     @param path Target path; its directory must exist.
     @param data File contents as bytes.
     @exception OSError when the file cannot be written or replaced.
     """
-    folder, name = os.path.split(os.path.abspath(path))
+    folder = os.path.dirname(os.path.abspath(path))
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
     for _ in range(100):
-        tmp = os.path.join(folder, '.%s.%s.tmp' % (name[:32], os.urandom(6).hex()))
+        tmp = os.path.join(folder, '.~%s.tmp' % os.urandom(4).hex())
         try:
             fd = os.open(tmp, flags, 0o666)
             break
@@ -6352,9 +6433,17 @@ def _write_atomic(path, data):
             st = None
         if st is not None and (st.st_mode & 0o170000) == 0o100000:  # regular file
             os.chmod(tmp, st.st_mode & 0o7777)
-        os.replace(tmp, path)
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if os.name != 'nt' or attempt == 5:
+                    raise
+                time.sleep(0.05 * 2**attempt)
     except BaseException:
         try:
+            os.chmod(tmp, 0o600)  # a copied read-only mode blocks removal on Windows
             os.remove(tmp)
         except OSError:
             pass
