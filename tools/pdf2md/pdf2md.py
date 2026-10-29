@@ -59,6 +59,8 @@ Python 3.8 or later. No third-party packages. No network access.
   document, output path equal to the input) or a file system error.
 - 2: the file cannot be parsed or is encrypted, or the conversion failed
   (reported in one line, without a traceback).
+- 3: the output was written but is incomplete. Each problem is printed on stderr
+  as one line with page number, kind and cause, also with -q (see problem()).
 
 @par Resource limits
 Hostile or damaged files are bounded by these limits; output of a file that
@@ -164,6 +166,47 @@ MAX_FONT_ENTRIES = 1 << 20
 MAX_FORM_RUNS = 2000
 ## @brief Upper limit for content stream operators executed for one page.
 MAX_PAGE_OPS = 5000000
+## @brief Upper limit for distinct entries kept in PROBLEMS; further ones are only counted.
+MAX_PROBLEMS = 1000
+## @brief Problems that made the output of the running conversion incomplete.
+##
+## Maps (page number or None, kind, text) to the number of occurrences, in insertion
+## order. kind is 'unsupported', 'malformed', 'limit' or 'internal'. analyze() clears
+## it; main() prints it and returns exit code 3 when it is not empty.
+PROBLEMS = {}
+## @brief One-element list with the page number that problem() attaches; None outside
+## a page.
+_CURRENT_PAGE = [None]
+
+
+def problem(kind, text):
+    """!
+    @brief Record a problem that makes the output incomplete.
+
+    Identical entries are counted once with a repeat count. After MAX_PROBLEMS
+    distinct entries, new ones go to a single overflow entry.
+    @param kind 'unsupported' (feature not handled), 'malformed' (damaged input),
+           'limit' (a MAX_* limit cut the output) or 'internal' (unexpected exception)
+    @param text one line that names the object and the cause, e.g. 'image 12 0 R: JBIG2Decode'
+    """
+    key = (_CURRENT_PAGE[0], kind, text)
+    if key not in PROBLEMS and len(PROBLEMS) >= MAX_PROBLEMS:
+        key = (None, 'limit', 'more problems not listed')
+    PROBLEMS[key] = PROBLEMS.get(key, 0) + 1
+
+
+def problem_lines():
+    """!
+    @brief Format PROBLEMS for stderr.
+    @return list of lines such as 'page 3: unsupported: image 12 0 R: JBIG2Decode (x2)'
+    """
+    out = []
+    for (page, kind, text), n in PROBLEMS.items():
+        where = 'page %d: ' % page if page is not None else ''
+        out.append('%s%s: %s%s' % (where, kind, text, ' (x%d)' % n if n > 1 else ''))
+    return out
+
+
 ## @brief Pattern for the EI keyword that ends inline image data.
 ##
 ## EI must follow a whitespace byte and be followed by whitespace or the end of data.
@@ -5135,8 +5178,8 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
     @brief Parse the file and lay out the selected pages.
 
     Page headers and footers are removed from the layouts (see _drop_repeats). A page
-    whose content fails to process is logged and kept as an empty layout. When /Rotate
-    is set but less than half the text reads upright, the unrotated view is used if it
+    whose content fails to process is recorded with problem() and kept as an empty
+    layout. When /Rotate is set but less than half the text reads upright, the unrotated view is used if it
     has more upright characters.
 
     @param pdf_path Path of the PDF file.
@@ -5148,6 +5191,8 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
                or it has no pages.
     @exception UsageError when no selected page exists in the document.
     """
+    PROBLEMS.clear()
+    _CURRENT_PAGE[0] = None
     with open(pdf_path, 'rb') as fh:
         data = fh.read()
     try:
@@ -5179,6 +5224,7 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
             continue
         if log:
             log('page %d/%d' % (i, len(page_list)))
+        _CURRENT_PAGE[0] = i
         box = _box(doc, inh)
         try:
             contents = doc.resolve(page.get('Contents'))
@@ -5206,9 +5252,9 @@ def analyze(pdf_path, pages=None, figures=True, log=None):
             box = rbox
             layouts.append(layout_page(i, pc, box, figures))
         except Exception as exc:
-            if log:
-                log('page %d skipped: %s' % (i, exc))
+            problem('internal', 'page skipped (%s: %s)' % (type(exc).__name__, exc))
             layouts.append(PageLayout(i, box, [], []))
+    _CURRENT_PAGE[0] = None
     _drop_repeats(layouts)
     return doc, page_list, layouts
 
@@ -5735,7 +5781,8 @@ def main(argv=None):
 
     @param argv Argument list; None uses sys.argv.
     @return Exit status: 0 on success, 1 for usage and file errors, 2 for files that
-            cannot be parsed and other conversion errors.
+            cannot be parsed and other conversion errors, 3 when the output was written
+            but PROBLEMS is not empty.
     """
     ap = _ArgumentParser(description='Convert a text-based PDF file to Markdown.')
     ap.add_argument('pdf', help='input PDF file')
@@ -5839,6 +5886,11 @@ def main(argv=None):
             )
         else:
             log('wrote %s (%s)' % (out, summary))
+    if PROBLEMS:
+        for line in problem_lines():
+            print('pdf2md: %s' % line, file=sys.stderr)
+        print('pdf2md: the output is incomplete', file=sys.stderr)
+        return 3
     return 0
 
 
