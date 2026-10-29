@@ -9,7 +9,7 @@ A release is tagged `pdf2md-v<version>`.
 ### Added
 
 - `pdf2md.py`: PDF to Markdown converter, single file, Python standard library only.
-- `test_pdf2md.py`: 90 regression tests.
+- `test_pdf2md.py`: 91 regression tests.
 - `Doxyfile`: Doxygen configuration for the API documentation.
 - Exit code 3 with one stderr line per problem (page, kind, cause), also with `-q`, when the output is incomplete.
 - Cross-reference chain reading from `startxref` (tables, streams, `/XRefStm`, `/Prev`) with generation numbers and free entries; file scan as fallback.

@@ -2048,6 +2048,18 @@ class ReviewRegressions(Base):
         self.assertEqual(rc, 0)
         self.assertLess(time.time() - t, 5)
 
+    def test_boxes_beyond_all_grid_levels_are_fast(self):
+        """!
+        @brief Test: 8000 lines of 2e300 pt on a page of that size cluster in under 5 s.
+        """
+        big = b'1' + b'0' * 300
+        c = b''.join(b'%d0 0 m %d0 2' % (i, i) + big + b' l S\n' for i in range(1, 8001))
+        f = self.pages_pdf([HELLO + c], media=b'0 0 3' + big + b' 3' + big)
+        t = time.time()
+        rc, _ = self.md(f)
+        self.assertEqual(rc, 0)
+        self.assertLess(time.time() - t, 5)
+
     def test_iso2022_cmaps_are_two_byte(self):
         """!
         @brief Test: /78-H, /GBT-H and /KSC-Johab-H have a known code space, no problem.

@@ -45,8 +45,8 @@ python pdf2md.py input.pdf --split-pages --flat  # page files without folders
   on at least 50 % of the pages, minimum 3 pages, are page headers or footers
   and are dropped. A figure is dropped only when it lies wholly inside one of
   these bands and the same figure (same rounded position, same shapes and image
-  data, same text with digits ignored) occurs there on that many pages. Figures elsewhere,
-  including full-page scans, are kept.
+  data, same text with digits ignored) occurs there on that many pages. Figures
+  elsewhere, including full-page scans, are kept.
 - Objects are read through the cross-reference chain from the last startxref
   (tables, cross-reference streams, /XRefStm, /Prev). The newest revision wins,
   free entries are ignored, and a reference with a different generation number
@@ -155,10 +155,11 @@ definition. Code blocks use a fence longer than any backtick run inside.
 - Predefined CMaps of composite fonts are read with the code space of their
   family (Identity, ISO-2022 including 78 and GBT, UCS2, UTF16, UTF32, RKSJ,
   EUC, GBK, GBK2K, Big Five, UHC, Johab, one-byte CMaps). The code-space tables
-  are family approximations, not the Adobe CMap files; Johab uses the UHC ranges. The predefined CID-to-Unicode mappings are not
-  included, so text comes from ToUnicode or the embedded TrueType cmap. UTF8 and
-  other unknown CMap names use the ToUnicode code space, or two-byte codes with
-  an unsupported problem when there is none.
+  are family approximations, not the Adobe CMap files; Johab uses the UHC
+  ranges. The predefined CID-to-Unicode mappings are not included, so text comes
+  from ToUnicode or the embedded TrueType cmap. UTF8 and other unknown CMap
+  names use the ToUnicode code space, or two-byte codes with an unsupported
+  problem when there is none.
 - Vertical writing mode (Identity-V) is read as horizontal text.
 - Type 3 glyph size is taken from the font size. The glyph space em is unknown.
 - Fonts without a /Widths array use built-in widths for codes 32-126 of
@@ -166,14 +167,14 @@ definition. Code blocks use a fence longer than any backtick run inside.
   Word gaps in that text can be misdetected and its SVG text is not
   width-fitted.
 - Rotated text outside figures is dropped.
-- Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI), and
-  Indexed images with a /Decode other than the default or [2^bits-1 0] are not
-  exported and are reported. Inline images are reported only when figures are
-  exported (no --no-figures), outside annotation appearances, and when placed at
-  1 pt or more; inline images in a header or footer band are reported too. Soft-mask transparency (/SMask) is ignored without
-  a report; the image is exported opaque. Lab colors and images are converted
-  to sRGB without chromatic adaptation, so colors with a D50 white point are
-  slightly shifted.
+- Images with CCITTFax or JBIG2 encoding, inline images (BI/ID/EI), and Indexed
+  images with a /Decode other than the default or [2^bits-1 0] are not exported
+  and are reported. Inline images are reported only when figures are exported
+  (no --no-figures), outside annotation appearances, and when placed at 1 pt or
+  more; inline images in a header or footer band are reported too. Soft-mask
+  transparency (/SMask) is ignored without a report; the image is exported
+  opaque. Lab colors and images are converted to sRGB without chromatic
+  adaptation, so colors with a D50 white point are slightly shifted.
 - When the cross-reference chain has one bad offset, the whole file is read by
   scanning. The scan does not apply free entries, so an object freed in a later
   revision can still be read; this case is reported as a problem.
@@ -269,7 +270,7 @@ MAX_GRID_CELLS = 1024
 ## the largest object number PDF 1.7 allows); /Size and the file length bound it too.
 MAX_XREF_ENTRIES = 8388607
 ## @brief Number of grid levels in figure clustering (cells of 64 pt x 32^k for level k
-## = 0..7, up to about 2.2e12 pt); boxes larger than that are compared with every box.
+## = 0..7, up to about 2.2e12 pt); larger boxes are not merged with other boxes.
 GRID_LEVELS = 8
 ## @brief Upper limit for distinct entries kept in PROBLEMS; further ones are only counted.
 MAX_PROBLEMS = 1000
@@ -1080,8 +1081,8 @@ class Document:
         @brief Read the entries of a /Type /XRef cross-reference stream.
 
         Entries of a type other than 0, 1 and 2 are returned too; they stand for null.
-        At most min(/Size, file length in bytes, MAX_XREF_ENTRIES) entries are read, and
-        object numbers at or above that bound are skipped.
+        At most min(/Size, file length in bytes, MAX_XREF_ENTRIES) entries are read (/Size
+        only when present), and object numbers at or above that bound are skipped.
         @param s the cross-reference Stream.
         @return list of (object number, (type, field 2, field 3)). Type 0 is free, type 1
         is (1, offset, generation) and type 2 is (2, object stream number, index).
@@ -1102,7 +1103,9 @@ class Document:
         rl = w0 + w1 + w2
         fb = int.from_bytes
         size = s.get('Size')
-        bound = min(size if type(size) is int else 0, len(self.data), MAX_XREF_ENTRIES)
+        bound = min(len(self.data), MAX_XREF_ENTRIES)
+        if type(size) is int and size >= 0:
+            bound = min(bound, size)
         out = []
         p = 0
         for i in range(0, len(index) - 1, 2):
@@ -3962,14 +3965,15 @@ def _merge_pass(groups, gap):
     """!
     @brief Merge every pair of groups whose boxes overlap within gap (one pass).
 
-    Pairs are found through grids: level k has cells of max(64, 4 * gap) * 32^k
-    points. Each box goes into the lowest level where it occupies at most
-    MAX_GRID_CELLS cells, and is checked against the boxes in the cells it touches on
-    its own level and on every coarser level. Every overlapping pair is found once a
-    box of the pair checks the level of the other. Boxes with coordinates that are not
-    finite, or that need more than GRID_LEVELS levels, are compared with every group.
-    Connected groups are joined with a union-find structure. A merged box can reach
-    further groups, so cluster() repeats the pass until the count stays the same.
+    Pairs are found through grids: level k has cells of max(64, 4 * gap) * 32^k points.
+    Each box goes into the lowest level where it occupies at most MAX_GRID_CELLS cells,
+    and is checked against the boxes in the cells it touches on its own level and on
+    every coarser level. Every overlapping pair is found once a box of the pair checks
+    the level of the other. A box with coordinates that are not finite, or that needs
+    more than GRID_LEVELS levels (larger than about 2.2e12 pt, beyond any valid page),
+    is not merged and stays a group of its own. Connected groups are joined with a
+    union-find structure. A merged box can reach further groups, so cluster() repeats
+    the pass until the count stays the same.
     @param groups list of [bbox list, member list, index of the last member in items]
     @param gap merge distance in points
     @return list of merged groups in the same form
@@ -3996,8 +4000,7 @@ def _merge_pass(groups, gap):
         return cx0, cx1, cy0, cy1
 
     grids = [{} for _ in range(GRID_LEVELS)]
-    placed = []  # (index, level)
-    rest = []  # groups that fit no level
+    placed = []  # (index, level); groups that fit no level stay unmerged
     for i, (bb, _, _) in enumerate(groups):
         for level in range(GRID_LEVELS):
             cx0, cx1, cy0, cy1 = cells(bb, level)
@@ -4009,8 +4012,6 @@ def _merge_pass(groups, gap):
                         grid.setdefault((cx, cy), []).append(i)
                 placed.append((i, level))
                 break
-        else:
-            rest.append(i)
     for i, own in placed:
         bb = groups[i][0]
         seen = {i}
@@ -4025,10 +4026,6 @@ def _merge_pass(groups, gap):
                         if j not in seen:
                             seen.add(j)
                             join(i, j)
-    for i in rest:
-        for j in range(len(groups)):
-            if j != i:
-                join(i, j)
     out = {}
     for i, (bb, members, last) in enumerate(groups):
         root = find(i)
@@ -4072,10 +4069,10 @@ class Region:
 
         The key holds the bbox rounded to whole points, the shape count, one entry per
         shape and the lower-case text of the characters in the region with each digit
-        run replaced by #, so page numbers inside a header or footer figure match. An image entry is the
-        length and CRC-32 of the raw image stream bytes, so equal images match even
-        when stored as separate objects. A path entry lists its segments with the
-        coordinates rounded to whole points.
+        run replaced by #, so page numbers inside a header or footer figure match. An
+        image entry is the length and CRC-32 of the raw image stream bytes, so equal
+        images match even when stored as separate objects. A path entry lists its
+        segments with the coordinates rounded to whole points.
         @return hashable tuple
         """
         b = self.bbox

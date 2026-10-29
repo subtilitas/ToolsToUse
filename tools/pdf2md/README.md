@@ -185,7 +185,7 @@ Output of a file that hits one is incomplete.
 
 ## Tests
 
-`test_pdf2md.py` holds 90 regression tests.
+`test_pdf2md.py` holds 91 regression tests.
 Each test builds the PDF it needs in a temporary directory.
 They need no network access.
 Tests that render Markdown with pandoc are skipped when pandoc is not installed.
